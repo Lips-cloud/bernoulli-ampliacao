@@ -23,8 +23,13 @@ if not PERFIS[perfil]:
 with st.expander("Regras aplicadas (perfil ENEM)"):
     st.markdown(
         "- Texto de **10 pt para 12 pt** (fator 1,2), em coluna única.\n"
-        "- Imagens e figuras ampliadas **1,2× na mesma proporção** (recorte exato do original). "
-        "Se uma figura não couber na largura da página, ela é limitada e listada no relatório.\n"
+        "- Imagens e figuras ampliadas **1,2× na mesma proporção** (recorte exato do original).\n"
+        "- Figura que **não cabe na página a 1,2×**: o app tenta **girar 90°**. Se girada também não chegar a 1,2×, "
+        "a figura fica **sozinha na página** (com crédito/fonte) e o restante da questão segue na página seguinte, "
+        "para você girar/ajustar à mão sem mexer em mais nada.\n"
+        "- **Prova I** (questões 1–90, com inglês/espanhol e redação) e **Prova II** (91–180) são identificadas "
+        "pela numeração. Na Prova I, a **folha de rascunho da redação** é ampliada e sai em **2 páginas** "
+        "(linhas 1–15 e 16–30), depois da página de instruções.\n"
         "- **Capa e contracapa não mudam.**\n"
         "- **Cabeçalho e rodapé** do original mantidos em todas as páginas (só o número da página é renumerado).\n"
         "- **Nenhuma questão é quebrada** entre páginas. Só se ela for maior que uma página inteira, "
@@ -64,16 +69,29 @@ if a:
                    "seriam esperadas (5 por questão). Confira o PDF antes de gerar.")
     else:
         st.success("Estrutura consistente: 5 alternativas para cada questão detectada.")
-    st.write("Página de instruções/rascunho da redação:",
-             f"página {a['pagina_rascunho']}" if a["pagina_rascunho"] else "não encontrada")
+    if a["prova"]:
+        q0, q1 = a["faixa_questoes"]
+        extra = " (inglês/espanhol nas questões 1–5)" if a["ingles_espanhol"] else ""
+        st.write(f"**Prova {a['prova']}** — questões {q0} a {q1}{extra}.")
+    for av in a["avisos"]:
+        st.warning(av)
+    if a["pagina_rascunho"]:
+        st.write(f"Página de instruções/rascunho da redação no original: página {a['pagina_rascunho']}. "
+                 f"No ampliado: instruções em página própria + {a['paginas_rascunho_saida']} páginas de rascunho.")
+    else:
+        st.write("Sem página de redação neste caderno.")
     if a["questoes_divididas"]:
         st.info("Questões grandes demais para uma página a 12 pt (serão divididas entre o texto-base e o "
                 "enunciado+alternativas): " + ", ".join(f"{q} ({h} pt)" for q, h in a["questoes_divididas"]))
     else:
         st.write("Nenhuma questão estoura uma página.")
-    if a["figuras_limitadas"]:
-        st.info("Figuras que não chegam a 1,2× por causa da largura da página: " +
-                ", ".join(f"pág. {f['pagina_origem']} (escala {f['escala']}×)" for f in a["figuras_limitadas"]))
+    for f in a["figuras_revisao"]:
+        if f["modo"] == "girada":
+            st.info(f"{f['questao']}: figura grande demais na posição normal; será **girada 90°** e ampliada 1,2× "
+                    "(página própria para a figura).")
+        else:
+            st.warning(f"{f['questao']}: figura não chega a 1,2× nem girada. Ficará **sozinha na página** a "
+                       f"{f['escala']}× (girada chegaria a {f['escala_girada']}×) — **revisão manual**.")
 
     # -------------------------------------------------------- etapa 2
     st.subheader("Etapa 2 — Geração")
@@ -93,19 +111,24 @@ if r:
     c1, c2 = st.columns(2)
     c1.metric("Páginas (original)", r["paginas_entrada"])
     c2.metric("Páginas (ampliado)", r["paginas_saida"])
-    if aud["ok"]:
-        fo, fn = f"{aud['orig']:,}".replace(",", "."), f"{aud['novo']:,}".replace(",", ".")
-        st.success(f"Auditoria de texto OK: {fo} caracteres no original e {fn} no ampliado, nenhuma diferença.")
+    for av in r["avisos"]:
+        st.warning(av)
+    if r["conferencia_ok"]:
+        st.success("Conferência final: todas as checagens passaram.")
     else:
-        st.error("Auditoria de texto encontrou diferenças. NÃO use este PDF sem conferir.")
-        st.json({"faltando": aud["faltando"], "a_mais": aud["a_mais"]})
+        st.error("A conferência final encontrou problemas. NÃO use este PDF sem conferir os itens em vermelho.")
+    for c in r["checagens"]:
+        st.markdown(f"{'✅' if c['ok'] else '❌'} **{c['nome']}** — {c['detalhe']}")
     if r["questoes_divididas"]:
         st.info("Questões divididas entre páginas: " + ", ".join(r["questoes_divididas"]))
     else:
         st.write("Nenhuma questão foi dividida entre páginas.")
-    if r["figuras_limitadas"]:
-        st.info("Figuras abaixo de 1,2×: " +
-                ", ".join(f"pág. {f['pagina_origem']} ({f['escala']}×)" for f in r["figuras_limitadas"]))
+    for f in r["figuras_revisao"]:
+        if f["modo"] == "girada":
+            st.info(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura girada 90°, 1,2×.")
+        else:
+            st.warning(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura sozinha na página a "
+                       f"{f['escala']}× — **girar/ajustar manualmente**.")
     st.caption("Não verificado automaticamente: o aspecto visual de cada página. Confira a prévia abaixo.")
 
     nome = arq.name.rsplit(".", 1)[0] + "_AMPLIADO_fonte12.pdf"
