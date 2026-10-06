@@ -3,7 +3,7 @@
 import hashlib
 import pymupdf
 import streamlit as st
-from ampliador.enem import analisar, ampliar
+from enem import analisar, ampliar
 
 st.set_page_config(page_title="PSM Ampliação", page_icon="🔎", layout="centered")
 st.title("PSM Ampliação")
