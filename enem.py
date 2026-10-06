@@ -17,11 +17,11 @@ from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph,
                                 Flowable, PageBreak)
 from reportlab.platypus.flowables import CondPageBreak
 
-from .enem_parse import build_items, load_page, Ln, find_rascunho_page
+from enem_parse import build_items, load_page, Ln, find_rascunho_page
 
 S = 1.2                                   # fator de ampliação (10 pt -> 12 pt)
 _HERE = os.path.dirname(os.path.abspath(__file__))
-FONT_DIR = os.path.join(os.path.dirname(_HERE), 'fonts') + os.sep
+FONT_DIR = _HERE + os.sep
 if not os.path.exists(FONT_DIR + 'Carlito-Regular.ttf'):
     FONT_DIR = '/usr/share/fonts/truetype/crosextra/'
 pdfmetrics.registerFont(TTFont('Car', FONT_DIR + 'Carlito-Regular.ttf'))
