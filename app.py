@@ -27,6 +27,10 @@ with st.expander("Regras aplicadas (perfil ENEM)"):
         "- Figura que **não cabe na página a 1,2×**: o app tenta **girar 90°**. Se girada também não chegar a 1,2×, "
         "a figura fica **sozinha na página** (com crédito/fonte) e o restante da questão segue na página seguinte, "
         "para você girar/ajustar à mão sem mexer em mais nada.\n"
+        "- **Tabelas, gráficos, esquemas, equações e alternativas com fração/raiz** são tratados como **imagem**: "
+        "o app recorta o bloco do PDF original e amplia 1,2× na mesma proporção (sem tentar reconstruir como texto). "
+        "Fração ou raiz no meio de um parágrafo vira uma pequena imagem dentro da linha. "
+        "Subscritos e sobrescritos (CO₂, 10⁹) continuam sendo texto.\n"
         "- **Prova I** (questões 1–90, com inglês/espanhol e redação) e **Prova II** (91–180) são identificadas "
         "pela numeração. Na Prova I, a **folha de rascunho da redação** é ampliada e sai em **2 páginas** "
         "(linhas 1–15 e 16–30), depois da página de instruções.\n"
@@ -85,6 +89,13 @@ if a:
                 "enunciado+alternativas): " + ", ".join(f"{q} ({h} pt)" for q, h in a["questoes_divididas"]))
     else:
         st.write("Nenhuma questão estoura uma página.")
+    if a.get("blocos_imagem"):
+        qs = sorted({b["questao"] for b in a["blocos_imagem"] if b.get("questao")})
+        st.info(f"{len(a['blocos_imagem'])} bloco(s) serão tratados como imagem (tabelas, gráficos, fórmulas, "
+                f"alternativas com fração/raiz) em {len(qs)} questão(ões): " + ", ".join(q.replace("QUESTÃO ", "") for q in qs))
+    if a.get("inline_imagens"):
+        st.info("Frações/raízes dentro de parágrafos viram imagem pequena na linha (páginas do original: "
+                + ", ".join(str(p) for p in a["inline_imagens"]) + ").")
     for f in a["figuras_revisao"]:
         if f["modo"] == "girada":
             st.info(f"{f['questao']}: figura grande demais na posição normal; será **girada 90°** e ampliada 1,2× "
@@ -123,6 +134,8 @@ if r:
         st.info("Questões divididas entre páginas: " + ", ".join(r["questoes_divididas"]))
     else:
         st.write("Nenhuma questão foi dividida entre páginas.")
+    if r.get("blocos_imagem"):
+        st.caption(f"Blocos tratados como imagem: {len(r['blocos_imagem'])} — confira na prévia as tabelas, gráficos e fórmulas.")
     for f in r["figuras_revisao"]:
         if f["modo"] == "girada":
             st.info(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura girada 90°, 1,2×.")
