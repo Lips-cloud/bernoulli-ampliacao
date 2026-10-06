@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 PSM Ampliação — perfil ENEM (caderno 2 colunas, Calibri 10 pt) -> coluna única, 12 pt (x1,2).
+Prova I (questões 1-90, com redação)  /  Prova II (questões 91-180, sem redação).
 
 API:
     analisar(pdf_bytes)            -> dict  (etapa 1: não gera PDF)
@@ -97,8 +98,13 @@ def markup(runs, src_doc, pno, text_scale=1.0):
 FIGS = []        # (pagina_novo, x, y_base, w, h, pagina_origem, rect)
 PAGE_SRC = {}    # pagina_novo -> primeira página de origem
 FRAME_Y = {}     # pagina_novo -> y (de baixo) logo abaixo do último flowable
+FRAME_X = {}     # pagina_novo -> x da margem esquerda usada
 GROUP_PAGES = {}  # id do grupo -> {'ini': pagina do cabeçalho, 'fim': pagina da última alternativa}
 NO_RULE_PAGES = set()
+FIG_NOTES = []   # figuras giradas / sozinhas em página (revisão manual)
+ROT = 90         # giro de figura larga demais (graus, sempre 90 — nunca de cabeça para baixo)
+FIG_RESERVA = 70  # espaço reservado para crédito/fonte da figura
+ROWS_PER_PAGE = 15
 
 
 class Tag(Flowable):
@@ -184,23 +190,80 @@ class AltFlow(Flowable):
         c.drawCentredString(r, cy - 2.8, self.letter)
 
 
+def classif_fig(rect):
+    """Decide como a figura entra: normal (1,2x), girada 90 graus (só se assim chega a 1,2x) ou
+    sozinha na página (não chega a 1,2x nem girada: fica na maior escala que cabe, para ajuste manual)."""
+    w, h = rect.width, rect.height
+    s_fit = min(FRAME_W / w, (FRAME_H - FIG_RESERVA) / h)
+    s_rot = min(FRAME_W / h, (FRAME_H - FIG_RESERVA) / w)
+    if s_fit >= S - 0.001:
+        return dict(modo='normal', escala=S, rot=0, escala_girada=round(min(S, s_rot), 2))
+    if s_rot >= S - 0.001:
+        return dict(modo='girada', escala=S, rot=ROT, escala_girada=round(min(S, s_rot), 2))
+    return dict(modo='sozinha', escala=round(min(S, s_fit), 3), rot=0, escala_girada=round(s_rot, 2))
+
+
 class Fig(Flowable):
     """Reserva o espaço da figura; o recorte vetorial original é colocado na segunda passada."""
-    def __init__(self, src_page, rect, maxw, scale=S, clip=None):
+    def __init__(self, src_page, rect, maxw, info=None):
         super().__init__()
         self.src_page, self.rect = src_page, rect
-        s = min(scale, maxw / rect.width)
-        self.scale_used = scale
-        self.w, self.h = rect.width * s, rect.height * s
+        c = classif_fig(rect)
+        self.mode, self.rot, s = c['modo'], c['rot'], c['escala']
+        self.info = info if info is not None else {}
+        self.info.update(modo=self.mode, escala=s, escala_girada=c['escala_girada'], pagina_origem=src_page + 1)
+        if self.rot:
+            self.w, self.h = rect.height * s, rect.width * s
+        else:
+            self.w, self.h = rect.width * s, rect.height * s
         self.hAlign = 'CENTER'
         self.spaceBefore, self.spaceAfter = 3, 2
     def wrap(self, aw, ah): return self.w, self.h
     def split(self, aw, ah): return []
     def draw(self):
         x, y = self.canv.absolutePosition(0, 0)
-        if self.scale_used == 1.0:
-            NO_RULE_PAGES.add(self.canv.getPageNumber())
-        FIGS.append((self.canv.getPageNumber(), x, y, self.w, self.h, self.src_page, self.rect))
+        self.info['pagina_saida'] = self.canv.getPageNumber() + 1
+        FIGS.append((self.canv.getPageNumber(), x, y, self.w, self.h, self.src_page, self.rect, self.rot))
+
+
+class RascPage(Flowable):
+    """Uma página da folha de rascunho da redação ampliada (15 linhas por página)."""
+    TITLE_H = 40.0
+    ROW_H = 40.0
+    NUM_W = 32.0
+    def __init__(self, first, n=ROWS_PER_PAGE):
+        super().__init__()
+        self.first, self.n = first, n
+        self.w, self.h = FRAME_W, self.TITLE_H + n * self.ROW_H
+        self.hAlign = 'CENTER'
+    def wrap(self, aw, ah): return self.w, self.h
+    def split(self, aw, ah): return []
+    def draw(self):
+        c = self.canv
+        NO_RULE_PAGES.add(c.getPageNumber())
+        tb = self.n * self.ROW_H                       # altura da tabela
+        # marca d'água (atrás das linhas)
+        c.saveState()
+        c.translate(self.w / 2, tb / 2)
+        c.rotate(45)
+        c.setFillColor(Color(0.89, 0.89, 0.89))
+        c.setFont('Car-B', 52)
+        c.drawCentredString(0, 8, 'RASCUNHO')
+        c.drawCentredString(0, -52, 'DA REDAÇÃO')
+        c.restoreState()
+        # título
+        c.setFillColor(INK); c.setFont('Car', 12)
+        c.drawCentredString(self.w / 2, tb + self.TITLE_H - 20, 'Transcreva a sua Redação para a Folha de Redação.')
+        # tabela
+        c.setStrokeColor(INK); c.setLineWidth(0.75)
+        c.rect(0, 0, self.w, tb, stroke=1, fill=0)
+        c.line(self.NUM_W, 0, self.NUM_W, tb)
+        for r in range(1, self.n):
+            c.line(0, r * self.ROW_H, self.w, r * self.ROW_H)
+        c.setFillColor(INK); c.setFont('Car', 17.4)
+        for r in range(self.n):
+            yc = tb - (r + 0.5) * self.ROW_H
+            c.drawCentredString(self.NUM_W / 2, yc - 0.33 * 17.4, str(self.first + r))
 
 
 class Rule(Flowable):
@@ -208,9 +271,15 @@ class Rule(Flowable):
 
 
 class Doc(BaseDocTemplate):
+    def handle_pageBegin(self):
+        # força a margem certa pela paridade da página: página de saída par (conteúdo ímpar) = X_EVEN
+        self.pageTemplate = self.pageTemplates[0 if (self.page + 1) % 2 == 1 else 1]
+        super().handle_pageBegin()
+
     def afterFlowable(self, fl):
         if self.frame is not None:
             FRAME_Y[self.page] = self.frame._y
+            FRAME_X[self.page] = self.frame._x1
 
 
 # ------------------------------------------------------------------ montagem dos itens
@@ -250,7 +319,9 @@ def item_flowables(it, src, state):
     if k == 'cap':
         al = {'right': TA_RIGHT, 'center': TA_CENTER, 'left': TA_LEFT}[it['align']]
         runs = [dict(r, size=8) if 't' in r else r for r in it['runs']]
-        return [Paragraph(markup(runs, src, pno), ParagraphStyle('c', parent=ST_CAP, alignment=al))]
+        pc = Paragraph(markup(runs, src, pno), ParagraphStyle('c', parent=ST_CAP, alignment=al))
+        pc.is_cap = True
+        return [pc]
     if k == 'fig':
         return [Fig(it['page'], it['rect'], FRAME_W)]
     if k == 'alt':
@@ -333,6 +404,32 @@ def build_story(items, src, instr_flowables):
             continue
         if g.get('newpage'):
             story.append(PageBreak())
+        fi = next((k for k, f in enumerate(fls) if isinstance(f, Fig) and f.mode != 'normal'), None)
+        if fi is not None:
+            # figura grande demais: ela fica sozinha na página (com crédito/fonte); o resto da questão
+            # vai para a página seguinte, para o fluxo e a numeração seguirem sem retoques.
+            f = fls[fi]
+            qn = next((x.text for x in fls if isinstance(x, QHead)), '?')
+            f.info.update(questao=qn)
+            FIG_NOTES.append(f.info)
+            j = fi + 1
+            while j < len(fls) and getattr(fls[j], 'is_cap', False):
+                j += 1
+            before, figblock, after = fls[:fi], fls[fi:j], fls[j:]
+            if not [x for x in before if not isinstance(x, (Tag, SecBox, QHead))]:
+                figblock, before = before + figblock, []          # só cabeçalho antes: vai junto da figura
+            if before:
+                story.append(CondPageBreak(min(height_of(before, FRAME_W) + 6, FRAME_H - 1)))
+                story.extend(before)
+            story.append(CondPageBreak(FRAME_H - 0.5))
+            story.append(Tag(f.src_page))
+            story.extend(figblock)
+            if after:
+                story.append(CondPageBreak(FRAME_H - 0.5))
+                story.append(Tag(f.src_page))
+                story.append(CondPageBreak(min(height_of(after, FRAME_W) + 6, FRAME_H - 1)))
+                story.extend(after)
+            continue
         total = height_of(fls, FRAME_W)
         if total <= FRAME_H - 2 or g['red']:
             story.append(CondPageBreak(min(total + 6, FRAME_H - 1)))
@@ -360,7 +457,7 @@ def rascunho_rect(src, rp):
 
 
 def instr_builder(src, rp):
-    """Instruções da redação (página do rascunho) + folha de rascunho (sem ampliar)."""
+    """Instruções da redação (página própria) + folha de rascunho ampliada em 2 páginas (15 linhas cada)."""
     def build():
         lines = [e for e in load_page(src, rp) if isinstance(e, Ln)]
         lines.sort(key=lambda l: l.y0)
@@ -386,9 +483,10 @@ def instr_builder(src, rp):
             st = ParagraphStyle('ins', parent=ST_BODY, alignment=TA_LEFT, leftIndent=ind + lw, bulletIndent=ind,
                                 spaceBefore=3)
             fl.append(Paragraph(tx, st, bulletText=it['num']))
-        fl.append(PageBreak())
-        fl.append(Tag(rp))
-        fl.append(Fig(rp, rascunho_rect(src, rp), FRAME_W, scale=1.0))
+        for first in (1, 1 + ROWS_PER_PAGE):               # linhas 1-15 e 16-30
+            fl.append(PageBreak())
+            fl.append(Tag(rp))
+            fl.append(RascPage(first))
         return fl
     return build
 
@@ -438,13 +536,13 @@ def pass2(src_path, content_path, out_path, npages, rp):
         n = i + 2
         pg = out.new_page(width=MBW, height=MBH)
         pg.show_pdf_page(pymupdf.Rect(O, O, O + W, O + H), content, i)
-        for (pn, x, y, w, h, sp, rect) in FIGS:
+        for (pn, x, y, w, h, sp, rect, rot) in FIGS:
             if pn != i + 1:
                 continue
             top = H - (y + h)
             tgt = pymupdf.Rect(O + x, O + top, O + x + w, O + top + h)
             clip = pymupdf.Rect(rect.x0 + O, rect.y0 + O, rect.x1 + O, rect.y1 + O)
-            pg.show_pdf_page(tgt, srcm, sp, clip=clip)
+            pg.show_pdf_page(tgt, srcm, sp, clip=clip, rotate=(360 - rot) % 360 if rot else 0)
         ybot = H - FRAME_Y.get(i + 1, H - FRAME_TOP)
         if FRAME_BOT - ybot > 26 and (i + 1) not in NO_RULE_PAGES:
             xl = (X_EVEN if n % 2 == 0 else X_ODD) + O
@@ -481,17 +579,51 @@ def pass2(src_path, content_path, out_path, npages, rp):
     return len(out)
 
 
-# ------------------------------------------------------------------ auditoria
+# ------------------------------------------------------------------ tipo de prova
+def detectar_prova(items):
+    """Prova I = questões 1-90 (com inglês/espanhol repetindo 1-5, e redação); Prova II = 91-180."""
+    nums = [int(i['num']) for i in items if i['k'] == 'qhead']
+    if not nums:
+        return dict(prova=None, minimo=None, maximo=None, ingles_espanhol=False)
+    ie = all(nums.count(n) == 2 for n in range(1, 6))
+    if max(nums) <= 90:
+        p = 'I'
+    elif min(nums) >= 91:
+        p = 'II'
+    else:
+        p = None
+    return dict(prova=p, minimo=min(nums), maximo=max(nums), ingles_espanhol=ie)
+
+
+# ------------------------------------------------------------------ auditoria / conferência
 def _norm(s):
     from collections import Counter
     return Counter(c for c in s.casefold() if not c.isspace() and c not in '-\u2003\u00ad')
 
 
-def auditar(src_path, out_path):
+def _eh_rascunho(page):
+    for blk in page.get_text('dict')['blocks']:
+        if blk['type'] == 0:
+            for l in blk['lines']:
+                for sp in l['spans']:
+                    if sp['size'] > 30 and 'RASCUNHO' in sp['text'].upper():
+                        return True
+    return False
+
+
+def auditar(src_path, out_path, rp=None):
+    """Compara o texto (contagem de caracteres) entre original e ampliado.
+    A folha de rascunho é conferida à parte (as páginas dela são refeitas)."""
     src, out = pymupdf.open(src_path), pymupdf.open(out_path)
     clip = pymupdf.Rect(0, 75, W, 744)
-    o = ''.join(src[p].get_text('text', clip=clip) for p in range(1, len(src) - 1))
-    n = ''.join(out[p].get_text('text', clip=clip) for p in range(1, len(out) - 1))
+    o = ''
+    for p in range(1, len(src) - 1):
+        c = clip
+        if p == rp:                                   # só as instruções; a tabela é conferida à parte
+            c = pymupdf.Rect(0, 75, W, rascunho_rect(src, rp).y0 - 2)
+        o += src[p].get_text('text', clip=c)
+    n = ''.join(out[p].get_text('text', clip=clip) for p in range(1, len(out) - 1)
+                if not (rp is not None and _eh_rascunho(out[p])))
     co, cn = _norm(o), _norm(n)
     falt = {k: co[k] - cn[k] for k in co if co[k] > cn[k]}
     extra = {k: cn[k] - co[k] for k in cn if cn[k] > co[k]}
@@ -499,22 +631,126 @@ def auditar(src_path, out_path):
                 ok=(not falt and not extra))
 
 
+def conferir(src_path, out_path, items, tipo, rp):
+    """Conferência final: texto + estrutura + figuras + numeração + rascunho. Devolve lista de checagens."""
+    out = pymupdf.open(out_path)
+    ck = []
+
+    def add(nome, ok, detalhe=''):
+        ck.append(dict(nome=nome, ok=bool(ok), detalhe=detalhe))
+
+    # 1) texto
+    aud = auditar(src_path, out_path, rp)
+    fo, fn = f"{aud['orig']:,}".replace(',', '.'), f"{aud['novo']:,}".replace(',', '.')
+    add('Texto: nenhum caractere perdido ou acrescentado', aud['ok'],
+        f'{fo} caracteres no original e {fn} no ampliado' if aud['ok']
+        else f"faltando={aud['faltando']} a_mais={aud['a_mais']}")
+
+    # 2) questões, mesma sequência
+    esp = [i['num'].lstrip('0') or '0' for i in items if i['k'] == 'qhead']
+    got = []
+    for p in range(1, len(out) - 1):
+        got += [m.lstrip('0') or '0' for m in re.findall(r'QUESTÃO\s+(\d+)', out[p].get_text('text', clip=pymupdf.Rect(0, 75, W, 744)))]
+    add('Questões: mesma quantidade e mesma ordem do original', got == esp,
+        f'{len(got)} questões' if got == esp else f'esperadas {len(esp)}, encontradas {len(got)}')
+
+    # 3) 5 alternativas A–E por questão
+    bad, cur = [], None
+    for it in items:
+        if it['k'] == 'qhead':
+            if cur is not None and cur[1] != list('ABCDE'):
+                bad.append(cur[0])
+            cur = [it['num'], []]
+        elif it['k'] == 'alt' and cur is not None:
+            cur[1].append(it['letter'])
+    if cur is not None and cur[1] != list('ABCDE'):
+        bad.append(cur[0])
+    add('Alternativas: A a E em todas as questões', not bad, 'ok' if not bad else 'verificar: ' + ', '.join(bad))
+
+    # 4) figuras: todas colocadas e dentro da área útil da página
+    nfig = sum(1 for i in items if i['k'] == 'fig')
+    fora = []
+    for (pn, x, y, w, h, sp, rect, rot) in FIGS:
+        xl = X_EVEN if (pn + 1) % 2 == 0 else X_ODD
+        if x < xl - 0.6 or x + w > xl + FRAME_W + 0.6 or y < H - FRAME_BOT - 0.6 or y + h > H - FRAME_TOP + 0.6:
+            fora.append(pn + 1)
+    add('Figuras: todas colocadas, nenhuma excede a página', len(FIGS) == nfig and not fora,
+        f'{len(FIGS)} de {nfig} figuras' + (f'; fora da área nas páginas {fora}' if fora else ''))
+
+    # 5) numeração de páginas sequencial no rodapé
+    errs = []
+    for p in range(1, len(out) - 1):
+        nums = []
+        for blk in out[p].get_text('dict', clip=pymupdf.Rect(0, 746, W, 765))['blocks']:
+            if blk['type'] == 0:
+                for l in blk['lines']:
+                    for sp in l['spans']:
+                        if sp['text'].strip().isdigit() and sp['font'].startswith('Carlito'):
+                            nums.append(int(sp['text']))
+        if nums != [p + 1]:
+            errs.append(p + 1)
+    add('Rodapé: numeração sequencial em todas as páginas', not errs,
+        'ok' if not errs else f'numeração divergente nas páginas {errs}')
+
+    # 5b) margens alternando conforme página par/ímpar (como no original)
+    mg = [pn for pn, x in sorted(FRAME_X.items()) if abs(x - (X_EVEN if pn % 2 == 1 else X_ODD)) > 0.5]
+    add('Margens: alternância par/ímpar igual à do original', not mg,
+        'ok' if not mg else f'margem trocada nas páginas {[m + 1 for m in mg][:15]}')
+
+    # 6) nenhuma página em branco, nenhum texto fora da folha
+    brancas, fora_tx = [], []
+    figpag = {pn + 1 for (pn, *_r) in FIGS}
+    for p in range(1, len(out) - 1):
+        d = out[p].get_text('dict', clip=pymupdf.Rect(0, 75, W, 744))
+        txt = ''.join(sp['text'] for b in d['blocks'] if b['type'] == 0 for l in b['lines'] for sp in l['spans']).strip()
+        if not txt and p not in figpag and not _eh_rascunho(out[p]):
+            brancas.append(p + 1)
+        for b in out[p].get_text('dict')['blocks']:
+            if b['type'] == 0 and (b['bbox'][0] < -1 or b['bbox'][2] > W + 1):
+                fora_tx.append(p + 1)
+    add('Páginas: nenhuma em branco, nenhum texto fora da folha', not brancas and not fora_tx,
+        'ok' if not (brancas or fora_tx) else f'em branco: {brancas}; texto fora: {sorted(set(fora_tx))}')
+
+    # 7) folha de rascunho (só Prova I)
+    if tipo['prova'] == 'I' and rp is not None:
+        pgs = [p for p in range(1, len(out) - 1) if _eh_rascunho(out[p])]
+        nums = []
+        for p in pgs:
+            for b in out[p].get_text('dict', clip=pymupdf.Rect(0, 75, W, 744))['blocks']:
+                if b['type'] == 0:
+                    for l in b['lines']:
+                        for sp in l['spans']:
+                            if sp['text'].strip().isdigit():
+                                nums.append(int(sp['text']))
+        add('Rascunho da redação: 2 páginas, linhas 1 a 30', len(pgs) == 2 and sorted(nums) == list(range(1, 31)),
+            f'{len(pgs)} página(s), linhas {min(nums) if nums else "-"} a {max(nums) if nums else "-"}')
+    elif tipo['prova'] == 'II':
+        pgs = [p for p in range(1, len(out) - 1) if _eh_rascunho(out[p])]
+        add('Prova II: sem folha de redação', not pgs, 'ok' if not pgs else f'rascunho encontrado nas páginas {[p+1 for p in pgs]}')
+    return aud, ck
+
+
 # ------------------------------------------------------------------ API
 def _reset():
     global TMP
     TMP = tempfile.mkdtemp(prefix='ampl_')
-    FIGS.clear(); PAGE_SRC.clear(); FRAME_Y.clear(); GROUP_PAGES.clear(); NO_RULE_PAGES.clear(); WARN.clear()
-    GROUP_LABEL.clear()
+    FIGS.clear(); PAGE_SRC.clear(); FRAME_Y.clear(); FRAME_X.clear(); GROUP_PAGES.clear(); NO_RULE_PAGES.clear(); WARN.clear()
+    GROUP_LABEL.clear(); FIG_NOTES.clear()
 
 
 def _figuras_limitadas(items):
     out = []
     for it in items:
         if it['k'] == 'fig':
-            s = min(S, FRAME_W / it['rect'].width)
-            if s < S - 0.001:
-                out.append(dict(pagina_origem=it['page'] + 1, escala=round(s, 2)))
+            c = classif_fig(it['rect'])
+            if c['modo'] == 'sozinha':
+                out.append(dict(pagina_origem=it['page'] + 1, escala=c['escala'], escala_girada=c['escala_girada']))
     return out
+
+
+def _figuras_giradas(items):
+    return [dict(pagina_origem=i['page'] + 1) for i in items
+            if i['k'] == 'fig' and classif_fig(i['rect'])['modo'] == 'girada']
 
 
 def _prepara(pdf_bytes, workdir):
@@ -525,7 +761,15 @@ def _prepara(pdf_bytes, workdir):
     rp = find_rascunho_page(src)
     pages = [p for p in range(1, len(src) - 1) if p != rp]
     items = build_items(src, pages)
-    return path, src, rp, items
+    tipo = detectar_prova(items)
+    avisos = []
+    if tipo['prova'] == 'I' and rp is None:
+        avisos.append('Prova I (questões 1-90) sem página de instruções/rascunho da redação: a folha de rascunho não será gerada.')
+    if tipo['prova'] == 'II' and rp is not None:
+        avisos.append('Numeração indica Prova II (91-180), mas há página de redação: confira o arquivo. A folha será mantida.')
+    if tipo['prova'] is None:
+        avisos.append('Não consegui identificar Prova I ou II pela numeração das questões.')
+    return path, src, rp, items, tipo, avisos
 
 
 def analisar(pdf_bytes):
@@ -533,7 +777,7 @@ def analisar(pdf_bytes):
     with LOCK:
         _reset()
         wd = tempfile.mkdtemp(prefix='ampl_in_')
-        path, src, rp, items = _prepara(pdf_bytes, wd)
+        path, src, rp, items, tipo, avisos = _prepara(pdf_bytes, wd)
         build_story(items, src, instr_builder(src, rp) if rp is not None else (lambda: []))
         qh = [i for i in items if i['k'] == 'qhead']
         return dict(
@@ -542,27 +786,33 @@ def analisar(pdf_bytes):
             alternativas=sum(1 for i in items if i['k'] == 'alt'),
             figuras=sum(1 for i in items if i['k'] == 'fig'),
             figuras_limitadas=_figuras_limitadas(items),
+            figuras_giradas=_figuras_giradas(items),
+            figuras_revisao=[dict(n) for n in FIG_NOTES],
             questoes_divididas=list(WARN),
             pagina_rascunho=None if rp is None else rp + 1,
             alternativas_esperadas=len(qh) * 5,
+            prova=tipo['prova'], faixa_questoes=(tipo['minimo'], tipo['maximo']),
+            ingles_espanhol=tipo['ingles_espanhol'],
+            paginas_rascunho_saida=2 if (tipo['prova'] == 'I' and rp is not None) else 0,
+            avisos=avisos,
         )
 
 
 def ampliar(pdf_bytes, progress=None):
-    """Etapa 2: gera o PDF ampliado e a auditoria."""
+    """Etapa 2: gera o PDF ampliado e a conferência final."""
     with LOCK:
         _reset()
         wd = tempfile.mkdtemp(prefix='ampl_run_')
         if progress: progress(0.1, 'Lendo a estrutura da prova...')
-        path, src, rp, items = _prepara(pdf_bytes, wd)
+        path, src, rp, items, tipo, avisos = _prepara(pdf_bytes, wd)
         content = os.path.join(wd, 'conteudo.pdf')
         if progress: progress(0.35, 'Remontando as páginas em coluna única, 12 pt...')
         npages = pass1(src, items, content, rp)
         if progress: progress(0.7, 'Aplicando figuras, cabeçalho e rodapé originais...')
         out_path = os.path.join(wd, 'ampliado.pdf')
         total = pass2(path, content, out_path, npages, rp)
-        if progress: progress(0.9, 'Conferindo o texto (auditoria)...')
-        aud = auditar(path, out_path)
+        if progress: progress(0.9, 'Conferindo o resultado...')
+        aud, checagens = conferir(path, out_path, items, tipo, rp)
         quebradas = [GROUP_LABEL.get(g, str(g)) for g, v in GROUP_PAGES.items() if v.get('ini') != v.get('fim')]
         with open(out_path, 'rb') as f:
             data = f.read()
@@ -570,4 +820,7 @@ def ampliar(pdf_bytes, progress=None):
         return dict(pdf=data, paginas_entrada=len(src), paginas_saida=total,
                     questoes=sum(1 for i in items if i['k'] == 'qhead'),
                     figuras_limitadas=_figuras_limitadas(items),
-                    questoes_divididas=quebradas, auditoria=aud)
+                    figuras_revisao=[dict(n) for n in FIG_NOTES],
+                    questoes_divididas=quebradas, auditoria=aud, checagens=checagens,
+                    conferencia_ok=all(c['ok'] for c in checagens),
+                    prova=tipo['prova'], avisos=avisos)
