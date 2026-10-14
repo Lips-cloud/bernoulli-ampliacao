@@ -1,34 +1,33 @@
 # -*- coding: utf-8 -*-
-"""PSM Ampliação — app Streamlit (perfil ENEM). Fluxo em duas etapas: 1) analisar  2) gerar."""
+"""PSM Ampliação — app Streamlit (perfis ENEM PPL 2025 e ENEM 2026). Fluxo em duas etapas: 1) analisar  2) gerar."""
 import hashlib
 import pymupdf
 import streamlit as st
-from enem import analisar, ampliar
+from enem import analisar, ampliar, PERFIS as PERFIS_MOTOR, detectar_perfil
 
 st.set_page_config(page_title="PSM Ampliação", page_icon="🔎", layout="centered")
 st.title("PSM Ampliação")
 st.caption("Amplia provas em PDF de layout fechado para alunos com baixa visão.")
 
-PERFIS = {
-    "ENEM": True,
-    "Bahiana": False, "SBAHIA 2E": False, "Módulo": False, "A4 Bernoulli": False, "Itinerários": False,
-}
-perfil = st.selectbox(
-    "Perfil da prova", list(PERFIS),
-    format_func=lambda p: p if PERFIS[p] else f"{p} (em breve)")
-if not PERFIS[perfil]:
-    st.info("Este perfil ainda não foi implementado. Por enquanto, só o perfil ENEM está disponível.")
+AUTO = "Detectar automaticamente"
+OPCOES = [AUTO] + [PERFIS_MOTOR[k]["rotulo"] for k in PERFIS_MOTOR] + [
+    "Bahiana (em breve)", "SBAHIA 2E (em breve)", "Módulo (em breve)", "A4 Bernoulli (em breve)", "Itinerários (em breve)"]
+escolha = st.selectbox("Perfil da prova", OPCOES)
+if escolha.endswith("(em breve)"):
+    st.info("Este perfil ainda não foi implementado. Por enquanto: ENEM 2026 e ENEM PPL 2025.")
     st.stop()
+perfil_escolhido = None if escolha == AUTO else next(k for k, v in PERFIS_MOTOR.items() if v["rotulo"] == escolha)
 
-with st.expander("Regras aplicadas (perfil ENEM)"):
+with st.expander("Regras aplicadas"):
     st.markdown(
-        "- Texto de **10 pt para 12 pt** (fator 1,2), em coluna única.\n"
-        "- Imagens e figuras ampliadas **1,2× na mesma proporção** (recorte exato do original).\n"
-        "- Figura que **não cabe na página a 1,2×**: o app tenta **girar 90°**. Se girada também não chegar a 1,2×, "
+        "- Texto do corpo ampliado para **12 pt** (ENEM 2026: Arial 9 → 12 pt, fator 1,33; ENEM PPL: Calibri 10 → 12 pt, fator 1,2), "
+        "em coluna única.\n"
+        "- Imagens e figuras ampliadas **na mesma proporção do texto** (recorte exato do original).\n"
+        "- Figura que **não cabe na página ampliada**: o app tenta **girar 90°**. Se girada também não chegar à ampliação, "
         "a figura fica **sozinha na página** (com crédito/fonte) e o restante da questão segue na página seguinte, "
         "para você girar/ajustar à mão sem mexer em mais nada.\n"
         "- **Tabelas, gráficos, esquemas, equações e alternativas com fração/raiz** são tratados como **imagem**: "
-        "o app recorta o bloco do PDF original e amplia 1,2× na mesma proporção (sem tentar reconstruir como texto). "
+        "o app recorta o bloco do PDF original e amplia na mesma proporção (sem tentar reconstruir como texto). "
         "Fração ou raiz no meio de um parágrafo vira uma pequena imagem dentro da linha. "
         "Subscritos e sobrescritos (CO₂, 10⁹) continuam sendo texto.\n"
         "- **Prova I** (questões 1–90, com inglês/espanhol e redação) e **Prova II** (91–180) são identificadas "
@@ -36,6 +35,8 @@ with st.expander("Regras aplicadas (perfil ENEM)"):
         "(linhas 1–15 e 16–30), depois da página de instruções.\n"
         "- **Capa e contracapa não mudam.**\n"
         "- **Cabeçalho e rodapé** do original mantidos em todas as páginas (só o número da página é renumerado).\n"
+        "- **Corte e sangria:** o app sempre trabalha pelo **tamanho final (corte)**. Se o PDF vier no tamanho final, "
+        "com sangria/marcas ou sem TrimBox, ele padroniza a página sozinho; se o formato for incompatível com o perfil, avisa.\n"
         "- **Nenhuma questão é quebrada** entre páginas. Só se ela for maior que uma página inteira, "
         "quebra entre o texto-base e o enunciado+alternativas.\n"
         "- Nenhum texto é redigitado: o app usa o texto vivo do PDF e confere, caractere a caractere, "
@@ -46,7 +47,7 @@ if not arq:
     st.stop()
 
 dados = arq.getvalue()
-chave = hashlib.md5(dados).hexdigest()
+chave = hashlib.md5(dados).hexdigest() + str(perfil_escolhido)
 if st.session_state.get("chave") != chave:
     st.session_state.clear()
     st.session_state["chave"] = chave
@@ -56,13 +57,17 @@ st.subheader("Etapa 1 — Análise")
 if st.button("Analisar prova"):
     with st.spinner("Lendo a estrutura do PDF..."):
         try:
-            st.session_state["analise"] = analisar(dados)
+            st.session_state["analise"] = analisar(dados, perfil_escolhido)
         except Exception as e:                                   # noqa
             st.session_state.pop("analise", None)
-            st.error(f"Não consegui ler este PDF como um caderno do perfil ENEM: {e}")
+            st.error(f"Não consegui ler este PDF: {e}")
 
 a = st.session_state.get("analise")
 if a:
+    st.write(f"**Perfil:** {a['perfil_rotulo']}" + (" (detectado automaticamente)" if perfil_escolhido is None else ""))
+    cx = a["caixas"]
+    (st.success if cx["situacao"] == "ok" else st.warning)(
+        f"Página: {cx['mensagem']} (página inteira {cx['media'][0]} × {cx['media'][1]} pt)")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Páginas", a["paginas"])
     c2.metric("Questões", a["questoes_blocos"])
@@ -98,18 +103,18 @@ if a:
                 + ", ".join(str(p) for p in a["inline_imagens"]) + ").")
     for f in a["figuras_revisao"]:
         if f["modo"] == "girada":
-            st.info(f"{f['questao']}: figura grande demais na posição normal; será **girada 90°** e ampliada 1,2× "
+            st.info(f"{f['questao']}: figura grande demais na posição normal; será **girada 90°** e ampliada na proporção do texto "
                     "(página própria para a figura).")
         else:
-            st.warning(f"{f['questao']}: figura não chega a 1,2× nem girada. Ficará **sozinha na página** a "
-                       f"{f['escala']}× (girada chegaria a {f['escala_girada']}×) — **revisão manual**.")
+            st.warning(f"{f['questao']}: figura não chega à ampliação do texto nem girada. Ficará **sozinha na página** a "
+                       f"{f['escala']:.2f}× (girada chegaria a {f['escala_girada']}×) — **revisão manual**.")
 
     # -------------------------------------------------------- etapa 2
     st.subheader("Etapa 2 — Geração")
     if st.button("Gerar PDF ampliado", type="primary"):
         barra = st.progress(0.0, text="Iniciando...")
         try:
-            r = ampliar(dados, lambda p, m: barra.progress(p, text=m))
+            r = ampliar(dados, lambda p, m: barra.progress(p, text=m), perfil_escolhido)
             st.session_state["resultado"] = r
         except Exception as e:                                   # noqa
             st.session_state.pop("resultado", None)
@@ -138,7 +143,7 @@ if r:
         st.caption(f"Blocos tratados como imagem: {len(r['blocos_imagem'])} — confira na prévia as tabelas, gráficos e fórmulas.")
     for f in r["figuras_revisao"]:
         if f["modo"] == "girada":
-            st.info(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura girada 90°, 1,2×.")
+            st.info(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura girada 90°.")
         else:
             st.warning(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura sozinha na página a "
                        f"{f['escala']}× — **girar/ajustar manualmente**.")
