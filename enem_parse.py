@@ -12,13 +12,32 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _FD = _HERE + os.sep if os.path.exists(os.path.join(_HERE, 'Carlito-Regular.ttf')) else '/usr/share/fonts/truetype/crosextra/'
 _METRIC = {}
 
+# parâmetros do perfil (preenchidos por set_profile)
+K = 1.0                       # tamanho do corpo / 10 pt (ENEM PPL = 1.0; ENEM 2026 = 0.9)
+CIRC_FONTS = ('bundesbahn',)  # fonte do marcador de alternativa
+FONT_FILES = {(False, False): 'Carlito-Regular.ttf', (True, False): 'Carlito-Bold.ttf',
+              (False, True): 'Carlito-Italic.ttf', (True, True): 'Carlito-BoldItalic.ttf'}
+QCODE = False                 # cabeçalho de questão com código alfanumérico à direita
+
+
+def TS(x):
+    """Limiar de tamanho (pt) ajustado ao corpo do perfil."""
+    return x * K
+
+
+def set_profile(k=1.0, circ_fonts=('bundesbahn',), font_files=None, body_top=75.0, body_bot=744.0, qcode=False):
+    global K, CIRC_FONTS, FONT_FILES, BODY_TOP, BODY_BOT, QCODE
+    K, CIRC_FONTS, QCODE = k, tuple(circ_fonts), qcode
+    BODY_TOP, BODY_BOT = body_top, body_bot
+    if font_files:
+        FONT_FILES = font_files
+    _METRIC.clear()
+
 
 def _metric(bold, italic):
     k = (bold, italic)
     if k not in _METRIC:
-        fn = {(False, False): 'Carlito-Regular.ttf', (True, False): 'Carlito-Bold.ttf',
-              (False, True): 'Carlito-Italic.ttf', (True, True): 'Carlito-BoldItalic.ttf'}[k]
-        _METRIC[k] = pymupdf.Font(fontfile=_FD + fn)
+        _METRIC[k] = pymupdf.Font(fontfile=_FD + FONT_FILES[k])
     return _METRIC[k]
 
 
@@ -28,7 +47,7 @@ def span_text(sp):
     chars = sp['chars']
     raw = ''.join(c['c'] for c in chars)
     f = sp['font'].lower()
-    if any(k in f for k in ('symbol', 'euclid', 'bundesbahn', 'times')) or not any(c.isalpha() for c in raw):
+    if any(k in f for k in ('symbol', 'euclid', 'bundesbahn', 'teste', 'times')) or not any(c.isalpha() for c in raw):
         return raw
     font = _metric('bold' in f, 'italic' in f)
     out, certain = [], []
@@ -145,7 +164,7 @@ def _hov(a, b):
 def _is_prose(ln):
     t = ln.text().strip()
     words = re.findall(r'[A-Za-zÀ-ÿ]{4,}', t)
-    return ln.size >= 9.0 and len(t) >= 25 and len(words) >= 3 and not any(p.get('circ') for p in ln.parts[:1])
+    return ln.size >= TS(9.0) and len(t) >= 25 and len(words) >= 3 and not any(p.get('circ') for p in ln.parts[:1])
 
 
 def load_page(doc, pno):
@@ -188,7 +207,7 @@ def load_page(doc, pno):
         for sp in spans:
             b, i = _style(sp['font'])
             fl = sp['font'].lower()
-            circ = 'bundesbahn' in fl
+            circ = any(cf in fl for cf in CIRC_FONTS)
             txt = span_text(sp)
             if 'symbol' in fl:
                 txt = ''.join(SYM_MAP.get(c, c) for c in txt)
@@ -206,7 +225,7 @@ def load_page(doc, pno):
         frags.append(dict(x0=x0, y0=y0, x1=x1, y1=y1, parts=parts, grp=grp, wide=wide, weird=weird, rot=rotated))
     def _base(f):
         ss = [p['size'] for p in f['parts'] if p.get('t', '').strip()]
-        mx = max(ss) if ss else 10.0
+        mx = max(ss) if ss else TS(10.0)
         main = [p for p in f['parts'] if p.get('t', '').strip() and p['size'] >= mx - 0.8]
         if not main:
             return f['y1']
@@ -233,18 +252,28 @@ def load_page(doc, pno):
             else:
                 m = dict(f); merged.append(m)
     merged.sort(key=lambda f: (f['grp'], round(f['y0']), f['x0']))
+    if QCODE:
+        def _txt(f):
+            return ''.join(p.get('t', '') for p in f['parts']).strip()
+        for q in [f for f in merged if re.match(r'^QUEST[ãÃ]O\s+\d+', _txt(f), re.I)]:
+            for f in list(merged):
+                if f is q or f['grp'] != q['grp'] or f['rot']:
+                    continue
+                if re.match(r'^[A-Z0-9]{4}$', _txt(f)) and abs(f['base'] - q['base']) < 4 and f['x0'] > q['x1'] \
+                        and max((p['size'] for p in f['parts'] if p.get('t', '').strip()), default=99) <= TS(8.5):
+                    q['parts'] += f['parts']; q['x1'] = max(q['x1'], f['x1']); merged.remove(f)
 
     # 2) subscritos/sobrescritos soltos (linhas pequenas) são anexados à linha-base
     def base_size(f):
         ss = [p['size'] for p in f['parts'] if p.get('t', '').strip()]
-        return max(ss) if ss else 10.0
-    smalls = [f for f in merged if base_size(f) <= 7.6 and not f['rot']]
+        return max(ss) if ss else TS(10.0)
+    smalls = [f for f in merged if base_size(f) <= TS(7.6) and not f['rot']]
     keep = [f for f in merged if f not in smalls]
     for sm in smalls:
         cx = (sm['x0'] + sm['x1']) / 2
         best, bd = None, 99
         for b in keep:
-            if b['grp'] != sm['grp'] and not (b['wide'] or sm['wide']) or b['rot'] or base_size(b) < 8:
+            if b['grp'] != sm['grp'] and not (b['wide'] or sm['wide']) or b['rot'] or base_size(b) < TS(8):
                 continue
             if b['x0'] - 1.5 <= cx <= b['x1'] + 1.5:
                 dy = (sm['y0'] + sm['y1']) / 2 - (b['y0'] + b['y1']) / 2
@@ -288,7 +317,7 @@ def load_page(doc, pno):
     for rect, ms in cl:
         if max(rect.width, rect.height) < 3.0 or (max(rect.width, rect.height) < 8 and min(rect.width, rect.height) >= 3):
             continue                                   # anéis de grau, pontos etc. (barras de fração finas ficam)
-        if rect.width > 150 and all(m.height < 6 for m in ms):
+        if rect.width > 60 and all(m.height < 6 for m in ms) and (rect.width > 150 or rect.height >= 1.8):
             continue                                   # só filetes (barra da questão, linha de fim de bloco)
         if any(_inside(rect, bg) for bg in big):
             continue                                   # desenho sobre uma figura raster: o recorte da figura já o leva
@@ -312,7 +341,7 @@ def load_page(doc, pno):
     def prose_f(f):
         t = ''.join(p.get('t', '') for p in f['parts']).strip()
         first = min(f['parts'], key=lambda p: p['x']) if f['parts'] else {}
-        return (base_size(f) >= 9.0 and len(t) >= 25 and len(re.findall(r'[A-Za-zÀ-ÿ]{4,}', t)) >= 3
+        return (base_size(f) >= TS(9.0) and len(t) >= 25 and len(re.findall(r'[A-Za-zÀ-ÿ]{4,}', t)) >= 3
                 and not first.get('circ'))
 
     def is_alt_letter(f):
@@ -350,14 +379,16 @@ def load_page(doc, pno):
                 rb = (R.x0, R.y0, R.x1, R.y1)
                 if _vov(fb, rb) >= (1.5 if chart_like else 3.0) and _hov(fb, rb) > 0:
                     if prose_f(f) and chart_like and not (T.x0 - 3 <= f['x0'] and f['x1'] <= T.x1 + 3):
-                        continue                             # parágrafo largo encostado no gráfico: não é do gráfico
+                        lh = max(fb[3] - fb[1], 1.0)
+                        if _vov(fb, rb) < 0.6 * lh:
+                            continue                         # parágrafo largo só encostado no gráfico: não é do gráfico
                     if not chart_like and prose_f(f):
                         hosts.append(k)                      # parágrafo que contém a fração/raiz
                     else:
                         members.append(k); R |= pymupdf.Rect(fb); T |= tight_box(f); changed = True
                 elif is_alt_letter(f) and _vov(fb, (T.x0, T.y0, T.x1, T.y1)) >= 3.5 and 0 <= T.x0 - f['x1'] < 45:
                     members.append(k); R |= pymupdf.Rect(fb); T |= tight_box(f); changed = True   # letra da alternativa
-                elif chart_like and not f['rot'] and base_size(f) < 9.4 and not _is_cap_like(f) and _dist(fb, rb) <= 10 \
+                elif chart_like and not f['rot'] and (base_size(f) < TS(9.4) or (K < 0.95 and _dist(fb, rb) <= 6 and not prose_f(f))) and not _is_cap_like(f) and _dist(fb, rb) <= 10 \
                         and len(''.join(p.get('t', '') for p in f['parts']).strip()) < 40:
                     members.append(k); R |= pymupdf.Rect(fb); T |= tight_box(f); changed = True      # rótulos de eixo / legenda
         R = T
@@ -449,7 +480,7 @@ def tight_box(f):
 
 
 def _is_cap_like(f):
-    return all(p['size'] <= 9.3 and not p['b'] for p in f['parts'] if p.get('t', '').strip()) and \
+    return all(p['size'] <= TS(9.3) and not p['b'] for p in f['parts'] if p.get('t', '').strip()) and \
         len(''.join(p.get('t', '') for p in f['parts']).strip()) > 25
 
 
@@ -468,7 +499,7 @@ def _make_ln(f, pno, gutter, boxes, small):
             parts.append(dict(x=r.x0, img=r))
     parts.sort(key=lambda p: p['x'])
     sizes = [(len(p['t']), p['size']) for p in parts if 't' in p and p.get('t', '').strip()]
-    size = max(sizes)[1] if sizes else 10.0
+    size = max(sizes)[1] if sizes else TS(10.0)
     # linha de base = origem dos trechos de tamanho principal
     main = [p['oy'] for p in parts if 't' in p and p.get('t', '').strip() and p['size'] >= size - 0.8]
     base = statistics.median(main) if main else None
@@ -478,7 +509,8 @@ def _make_ln(f, pno, gutter, boxes, small):
             p['pos'] = 'sub' if d > 1.2 else ('sup' if d < -1.2 else None)
     ln = Ln(page=pno, x0=x0, y0=y0, x1=x1, y1=y1, parts=parts, size=size, grp=f['grp'], wide=f['wide'], gutter=gutter)
     txts = [p for p in parts if 't' in p and p.get('t', '').strip()]
-    ln.allbold = bool(txts) and all(p['b'] for p in txts)
+    tb = [p for p in txts if not (QCODE and p['size'] <= TS(8.5))] or txts
+    ln.allbold = bool(tb) and all(p['b'] for p in tb)
     ln.boxed = any(bx.x0 - 2 <= x0 and x1 <= bx.x1 + 2 and bx.y0 - 2 <= y0 and y1 <= bx.y1 + 2 for bx in boxes)
     ln.taint = False
     ln.extra = []
@@ -489,17 +521,21 @@ def classify(ln, left, right):
     """Define o tipo da linha."""
     t = ln.text().strip()
     p0 = ln.parts[0]
-    if ln.allbold and 10.5 <= ln.size <= 11.5:
-        if re.match(r'^QUEST[ãÃ]O\s+\d+', t, re.I):
-            return 'qhead'
+    if ln.allbold and re.match(r'^QUEST[ãÃ]O\s+\d+', t, re.I):
+        return 'qhead'
+    if ln.allbold and re.match(r'^(PROPOSTA DE REDAÇÃO|INSTRUÇÕES PARA A REDAÇÃO)\s*$', t, re.I):
         return 'sec'
-    if p0.get('circ') and len(p0['t'].strip()) == 1 and p0['t'].strip() in 'ABCDE':
+    if ln.allbold and TS(10.5) <= ln.size <= TS(11.5):
+        return 'sec'
+    if p0.get('circ') and re.match(r'^[A-E]\.?$', p0.get('t', '').strip()):
         return 'alt'
-    if ln.size <= 9.3 and not ln.allbold:
+    if QCODE and re.match(r'^[A-Z0-9]{4}$', t) and ln.size <= TS(8.5):
+        return 'code'
+    if ln.size <= TS(9.3) and not ln.allbold:
         return 'cap'
     if ln.allbold and re.match(r'^TEXTO\s+[IVX]+\s*$', t, re.I):
         return 'label'
-    if ln.allbold and ln.size >= 9.5:
+    if ln.allbold and ln.size >= TS(9.5):
         mid = (ln.x0 + ln.x1) / 2
         if abs(mid - (left + right) / 2) < 7:
             return 'title'
@@ -528,7 +564,7 @@ def runs_of(ln, drop_first_letter=False):
             continue
         t = p['t']
         if drop_first_letter and first:
-            t = t.strip()[1:] if t.strip() else ''
+            t = re.sub(r'^[A-E]\.?', '', t.strip(), count=1) if t.strip() else ''
             first = False
         runs.append(dict(t=t, b=p['b'], i=p['i'], size=p['size'], pos=p.get('pos')))
     return runs
@@ -542,11 +578,11 @@ def build_items(doc, pages):
         # limites de cada grupo (coluna)
         grp_lines = {}
         for e in els:
-            if isinstance(e, Ln) and e.size > 9.3 and not e.boxed:
+            if isinstance(e, Ln) and e.size > TS(9.3) and not e.boxed:
                 grp_lines.setdefault(e.grp, []).append(e)
         lr = {}
         for g in (0, 1, 2):
-            ls = [e for e in els if isinstance(e, Ln) and e.grp == g and e.size > 9.3]
+            ls = [e for e in els if isinstance(e, Ln) and e.grp == g and e.size > TS(9.3)]
             if not ls:
                 ls = [e for e in els if isinstance(e, Ln) and e.grp == g]
             if ls:
@@ -606,7 +642,12 @@ def build_items(doc, pages):
         if kind == 'qhead':
             flush()
             m = re.search(r'(\d+)', e.text())
-            items.append(dict(k='qhead', num=m.group(1), src=e.page))
+            mc = re.search(r'QUEST[ãÃ]O\s+\d+\s*([A-Z0-9]{4})\s*$', e.text().strip(), re.I)
+            items.append(dict(k='qhead', num=m.group(1), src=e.page, code=(mc.group(1) if mc else None)))
+            continue
+        if kind == 'code':
+            flush()
+            items.append(dict(k='code', text=e.text().strip(), src=e.page))
             continue
         if kind == 'alt':
             flush()
