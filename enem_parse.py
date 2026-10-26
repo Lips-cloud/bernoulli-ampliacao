@@ -690,7 +690,12 @@ def prose_items(ls):
     rights = {id(l): rt for l, _, rt in ls}
     # passo de linha típico
     diffs = [b.y0 - a.y0 for a, b in zip(lines, lines[1:]) if a.grp == b.grp and a.page == b.page and 0 < b.y0 - a.y0 < 20]
-    pitch = statistics.median(diffs) if diffs else 12.5
+    if len(diffs) >= 3:
+        pitch = statistics.median(diffs)
+    elif diffs:
+        pitch = min(diffs)          # poucas linhas: a mediana mistura entrelinha com espaço entre parágrafos
+    else:
+        pitch = 12.5
 
     segs, cur = [], [lines[0]]
     for a, b in zip(lines, lines[1:]):
