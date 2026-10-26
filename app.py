@@ -3,11 +3,11 @@
 import hashlib
 import pymupdf
 import streamlit as st
-from enem import analisar, ampliar, PERFIS as PERFIS_MOTOR, detectar_perfil
+from enem import analisar, ampliar, PERFIS as PERFIS_MOTOR, detectar_perfil, VERSAO
 
 st.set_page_config(page_title="PSM Ampliação", page_icon="🔎", layout="centered")
 st.title("PSM Ampliação")
-st.caption("Amplia provas em PDF de layout fechado para alunos com baixa visão.")
+st.caption(f"Amplia provas em PDF de layout fechado para alunos com baixa visão. — motor {VERSAO}")
 
 AUTO = "Detectar automaticamente"
 OPCOES = [AUTO] + [PERFIS_MOTOR[k]["rotulo"] for k in PERFIS_MOTOR] + [
@@ -37,6 +37,8 @@ with st.expander("Regras aplicadas"):
         "- **Cabeçalho e rodapé** do original mantidos em todas as páginas (só o número da página é renumerado).\n"
         "- **Corte e sangria:** o app sempre trabalha pelo **tamanho final (corte)**. Se o PDF vier no tamanho final, "
         "com sangria/marcas ou sem TrimBox, ele padroniza a página sozinho; se o formato for incompatível com o perfil, avisa.\n"
+        "- Figura larga demais para 1,2×: entra **junto com a questão**, na maior escala que cabe na largura "
+        "(nunca menor que o original). Só gira ou fica sozinha se fosse ficar menor que o original.\n"
         "- **Nenhuma questão é quebrada** entre páginas. Só se ela for maior que uma página inteira, "
         "quebra entre o texto-base e o enunciado+alternativas.\n"
         "- Nenhum texto é redigitado: o app usa o texto vivo do PDF e confere, caractere a caractere, "
