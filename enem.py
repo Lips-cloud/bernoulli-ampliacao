@@ -144,6 +144,7 @@ GROUP_PAGES = {}  # id do grupo -> {'ini': pagina do cabeçalho, 'fim': pagina d
 NO_RULE_PAGES = set()
 FIG_NOTES = []   # figuras giradas / sozinhas em página (revisão manual)
 BLOCOS = []      # blocos vetoriais convertidos em imagem (tabelas, gráficos, fórmulas, alternativas)
+ESC_MIN = 1.0    # figura nunca fica menor que no original; abaixo disso vai para girada/sozinha (revisão manual)
 ROT = 90         # giro de figura larga demais (graus, sempre 90 — nunca de cabeça para baixo)
 FIG_RESERVA = 70  # espaço reservado para crédito/fonte da figura
 ROWS_PER_PAGE = 15
@@ -274,6 +275,10 @@ def classif_fig(rect):
     s_rot = min(FRAME_W / h, (FRAME_H - FIG_RESERVA) / w)
     if s_fit >= S - 0.001:
         return dict(modo='normal', escala=S, rot=0, escala_girada=round(min(S, s_rot), 2))
+    if s_fit >= ESC_MIN - 0.001:
+        # larga demais para 1,2x, mas cabe na largura sem ficar menor que o original:
+        # entra no fluxo normal da questão (sem girar, sem página própria), na maior escala que cabe
+        return dict(modo='ajustada', escala=round(s_fit, 3), rot=0, escala_girada=round(min(S, s_rot), 2))
     if s_rot >= S - 0.001:
         return dict(modo='girada', escala=S, rot=ROT, escala_girada=round(min(S, s_rot), 2))
     return dict(modo='sozinha', escala=round(min(S, s_fit), 3), rot=0, escala_girada=round(s_rot, 2))
@@ -507,7 +512,7 @@ def build_story(items, src, instr_flowables):
             continue
         if g.get('newpage'):
             story.append(PageBreak())
-        fi = next((k for k, f in enumerate(fls) if isinstance(f, Fig) and f.mode != 'normal'), None)
+        fi = next((k for k, f in enumerate(fls) if isinstance(f, Fig) and f.mode not in ('normal', 'ajustada')), None)
         if fi is not None:
             # figura grande demais: ela fica sozinha na página (com crédito/fonte); o resto da questão
             # vai para a página seguinte, para o fluxo e a numeração seguirem sem retoques.
@@ -661,6 +666,11 @@ def pass2(src_path, content_path, out_path, npages, rp):
                 return c
         return first
 
+    # páginas onde uma questão dividida continua na página seguinte: sem o filete de "fim de questão"
+    continua = set()
+    for v in GROUP_PAGES.values():
+        if v.get('ini') and v.get('fim') and v['fim'] > v['ini']:
+            continua.update(range(v['ini'], v['fim']))
     for i in range(npages):
         n = i + 2
         pg = out.new_page(width=MBW, height=MBH)
@@ -673,7 +683,7 @@ def pass2(src_path, content_path, out_path, npages, rp):
             clip = pymupdf.Rect(rect.x0 + O, rect.y0 + O, rect.x1 + O, rect.y1 + O)
             pg.show_pdf_page(tgt, srcm, sp, clip=clip, rotate=(360 - rot) % 360 if rot else 0)
         ybot = H - FRAME_Y.get(i + 1, H - FRAME_TOP)
-        if FRAME_BOT - ybot > 26 and (i + 1) not in NO_RULE_PAGES:
+        if FRAME_BOT - ybot > 26 and (i + 1) not in NO_RULE_PAGES and (i + 1) not in continua:
             xl = (X_EVEN if n % 2 == 0 else X_ODD) + O
             yy = O + ybot + 8
             shp = pg.new_shape()
