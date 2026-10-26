@@ -505,6 +505,10 @@ def _make_ln(f, pno, gutter, boxes, small):
     parts.sort(key=lambda p: p['x'])
     sizes = [(len(p['t']), p['size']) for p in parts if 't' in p and p.get('t', '').strip()]
     size = max(sizes)[1] if sizes else TS(10.0)
+    # ex.: '124I' (isótopo): o número sobrescrito tem mais caracteres que a letra, mas o corpo é o da letra
+    big = max((p['size'] for p in parts if 't' in p and re.search(r'[A-Za-zÀ-ÿ]', p.get('t', ''))), default=size)
+    if size < big * 0.8:
+        size = big
     # linha de base = origem dos trechos de tamanho principal
     main = [p['oy'] for p in parts if 't' in p and p.get('t', '').strip() and p['size'] >= size - 0.8]
     base = statistics.median(main) if main else None
@@ -667,7 +671,7 @@ def build_items(doc, pages):
         flush()
         buf = dict(kind=kind, lines=[(e, left, right)])
     flush()
-    return _formulas_no_texto(items, doc)
+    return _alternativas_em_linha(_formulas_no_texto(items, doc), doc)
 
 
 def _formulas_no_texto(items, doc):
@@ -730,6 +734,66 @@ def _formulas_no_texto(items, doc):
                 continue
             ind = tira.x0 - cl if tira.x0 - cl > 8 else 0.0
             out.append(dict(k='para', runs=[img], indent=ind, left=0.0, justify=False, src=it['src'], nlines=1, center=False))
+    return out
+
+
+def _alternativas_em_linha(items, doc):
+    """Alternativa com fórmula (fração, raiz, expoente) que o parser recortou como figura:
+    1) junta ao recorte a parte da fórmula que ficou separada (ex.: 'σ1 =' + a fração ao lado);
+    2) tira o círculo da letra do recorte e devolve como alternativa comum com a fórmula embutida —
+       assim a letra e o recuo ficam iguais aos das alternativas de texto."""
+    # 1) fórmula da alternativa separada em outro bloco ao lado
+    for i, it in enumerate(items):
+        if it.get('k') != 'altfig':
+            continue
+        R = it['rect']
+        for j in (i - 1, i + 1):
+            o = items[j] if 0 <= j < len(items) else None
+            if not (o and o.get('k') == 'fig' and o.get('vector') and o.get('page') == it['page']):
+                continue
+            Q = o['rect']
+            sob = min(R.y1, Q.y1) - max(R.y0, Q.y0)
+            if sob > 0.6 * min(R.height, Q.height) and -2 <= Q.x0 - R.x1 <= 8 and Q.height <= 3 * max(R.height, 12):
+                it['rect'] = pymupdf.Rect(R) | Q
+                o['k'] = '_drop'
+                R = it['rect']
+    items = [it for it in items if it.get('k') != '_drop']
+    # 2) círculo da letra fora do recorte; fórmula entra como imagem na alternativa
+    out = []
+    for it in items:
+        if it.get('k') != 'altfig':
+            out.append(it)
+            continue
+        R = it['rect']
+        page = doc[it['page']]
+        circ_x1, conteudo_x0 = None, None
+        for b in page.get_text('rawdict', clip=R)['blocks']:
+            if b['type'] != 0:
+                continue
+            for l in b['lines']:
+                for sp in l['spans']:
+                    eh_circ = any(cf in sp['font'].lower() for cf in CIRC_FONTS)
+                    for ch in sp['chars']:
+                        if not ch['c'].strip():
+                            continue
+                        if eh_circ:
+                            circ_x1 = max(circ_x1 or 0, ch['bbox'][2])
+                        else:
+                            conteudo_x0 = min(conteudo_x0 or 9e9, ch['bbox'][0])
+        if circ_x1 is None:
+            out.append(it)
+            continue
+        for dr in page.get_drawings():
+            rr = dr['rect']
+            if rr.x0 > circ_x1 + 0.5 and rr.intersects(R) and R.contains(rr.tl):
+                conteudo_x0 = min(conteudo_x0 or 9e9, rr.x0)
+        if conteudo_x0 is None or conteudo_x0 >= R.x1:
+            out.append(it)
+            continue
+        crop = pymupdf.Rect(max(circ_x1 + 0.3, conteudo_x0 - 0.8), R.y0, R.x1, R.y1)
+        EXCL.append((it['page'], pymupdf.Rect(crop)))
+        out.append(dict(k='alt', letter=it.get('letter'), src=it['src'],
+                        runs=[dict(t='', b=False, i=False, size=10), dict(x=crop.x0, x1=crop.x1, img=crop, math=True)]))
     return out
 
 
