@@ -360,6 +360,9 @@ def load_page(doc, pno):
     for a0 in anchors:
         if any(c.x0 - 1 <= a0.x0 and a0.x1 <= c.x1 + 1 and c.y0 - 1 <= a0.y0 and a0.y1 <= c.y1 + 1 for c in claimed):
             continue                                          # já faz parte de um bloco maior
+        if any(ep == pno and er.x0 - 1 <= a0.x0 and a0.x1 <= er.x1 + 1 and er.y0 - 1 <= a0.y0 and a0.y1 <= er.y1 + 1
+               for ep, er in EXCL):
+            continue                                          # barra de fração que já entrou na imagem da linha
         T = pymupdf.Rect(a0)                                  # retângulo justo do bloco
         R = pymupdf.Rect(a0)                                  # área de busca de membros
         a_bars = [bb for bb in bars if not (bb.x1 < a0.x0 - 1 or bb.x0 > a0.x1 + 1 or bb.y1 < a0.y0 - 1 or bb.y0 > a0.y1 + 1)]
@@ -632,7 +635,7 @@ def build_items(doc, pages):
             flush()
             if e.get('vector'):
                 items.append(dict(k=('altfig' if e.get('alt') else 'fig'), page=e['page'], rect=e['rect'], src=e['page'],
-                                  vector=True, letter=e.get('alt'), tipo=e.get('tipo')))
+                                  vector=True, letter=e.get('alt'), tipo=e.get('tipo'), colleft=left))
             else:
                 items.append(dict(k='fig', page=e['page'], rect=e['rect'], src=e['page']))
             continue
@@ -664,7 +667,70 @@ def build_items(doc, pages):
         flush()
         buf = dict(kind=kind, lines=[(e, left, right)])
     flush()
-    return items
+    return _formulas_no_texto(items, doc)
+
+
+def _formulas_no_texto(items, doc):
+    """Bloco de fórmula que começa na margem da coluna é TEXTO corrido com fração (ex.: 'O = 16 g/mol.'),
+    não uma equação destacada. Em vez de virar figura solta, cada linha dele vira imagem dentro do parágrafo:
+    a 1ª linha continua o parágrafo anterior quando ele não terminou (; , :)."""
+    out = []
+    for it in items:
+        mem = KEEP.get((it.get('page'), tuple(round(v, 1) for v in it['rect']))) if it.get('k') == 'fig' else None
+        if not (it.get('k') == 'fig' and it.get('vector') and it.get('tipo') == 'tabela/gráfico/fórmula' and mem
+                and it.get('colleft') is not None and abs(it['rect'].x0 - it['colleft']) < 4 and it['rect'].height <= 60):
+            out.append(it)
+            continue
+        R, cl = it['rect'], it['colleft']
+        # linhas que começam na margem (ou no recuo de parágrafo) abrem uma nova linha de texto;
+        # as demais (numerador/denominador da fração) pertencem à linha com que mais se sobrepõem
+        lin = sorted(mem, key=lambda r: (r.y0, r.x0))
+        grupos = []
+        for r in lin:
+            if r.x0 - cl < 25 or not grupos:
+                grupos.append([r])
+            else:
+                best = max(grupos, key=lambda g: min(r.y1, max(b.y1 for b in g)) - max(r.y0, min(b.y0 for b in g)))
+                best.append(r)
+        if len(grupos) > 4:
+            out.append(it)
+            continue
+        # caracteres do bloco, com a linha a que pertencem (para apagar o que "vaza" de uma linha na imagem da outra)
+        chars = []
+        for b in doc[it['page']].get_text('rawdict', clip=R)['blocks']:
+            if b['type'] != 0:
+                continue
+            for l in b['lines']:
+                for sp in l['spans']:
+                    for ch in sp['chars']:
+                        bb = pymupdf.Rect(ch['bbox'])
+                        c = pymupdf.Point((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2)
+                        gi = next((k for k, g in enumerate(grupos) if any(m.contains(c) for m in g)), None)
+                        base = ch['origin'][1]
+                        chars.append((gi, pymupdf.Rect(bb.x0, bb.y0, bb.x1, min(bb.y1, base + 0.8))))
+        tiras = []
+        for gi, g in enumerate(grupos):
+            u = pymupdf.Rect(g[0])
+            for m in g[1:]:
+                u |= m
+            tira = pymupdf.Rect(u.x0 - 0.7, max(u.y0 - 0.5, R.y0), u.x1 + 0.7, min(u.y1 + 0.5, R.y1))
+            mask = [bb for (k, bb) in chars if k is not None and k != gi and bb.intersects(tira)]
+            tiras.append((tira, mask))
+        for n, (tira, mask) in enumerate(tiras):
+            EXCL.append((it['page'], pymupdf.Rect(tira)))
+            img = dict(x=tira.x0, x1=tira.x1, img=tira, math=True, mask=mask)
+            prev = out[-1] if out else None
+            txt_prev = ''.join(r.get('t', '') for r in prev.get('runs', [])).rstrip() if prev and prev.get('k') == 'para' else ''
+            if n == 0 and prev is not None and prev.get('k') == 'para' and prev.get('src') == it['src'] \
+                    and not txt_prev.endswith(('.', '?', '!')) \
+                    and (txt_prev.endswith((';', ',', ':')) or (prev['runs'] and 'img' in prev['runs'][-1])):
+                prev['runs'].append(dict(t=' ', b=False, i=False, size=10))
+                prev['runs'].append(img)
+                prev['nlines'] = prev.get('nlines', 1) + 1
+                continue
+            ind = tira.x0 - cl if tira.x0 - cl > 8 else 0.0
+            out.append(dict(k='para', runs=[img], indent=ind, left=0.0, justify=False, src=it['src'], nlines=1, center=False))
+    return out
 
 
 # ---------------------------------------------------------------- parágrafos / versos
