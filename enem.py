@@ -21,6 +21,7 @@ from reportlab.platypus.flowables import CondPageBreak
 import enem_parse
 from enem_parse import build_items, load_page, Ln, find_rascunho_page
 
+VERSAO = '2026-10-26 v2 (quebras de figura)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
 S = 1.2                                   # fator de ampliação (corpo -> 12 pt)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_DIRS = [_HERE + os.sep, '/usr/share/fonts/truetype/crosextra/', '/usr/share/fonts/truetype/liberation/']
@@ -141,6 +142,7 @@ PAGE_SRC = {}    # pagina_novo -> primeira página de origem
 FRAME_Y = {}     # pagina_novo -> y (de baixo) logo abaixo do último flowable
 FRAME_X = {}     # pagina_novo -> x da margem esquerda usada
 GROUP_PAGES = {}  # id do grupo -> {'ini': pagina do cabeçalho, 'fim': pagina da última alternativa}
+GROUP_H = {}      # id do grupo -> (altura total em pt, quebra permitida?)
 NO_RULE_PAGES = set()
 FIG_NOTES = []   # figuras giradas / sozinhas em página (revisão manual)
 BLOCOS = []      # blocos vetoriais convertidos em imagem (tabelas, gráficos, fórmulas, alternativas)
@@ -503,6 +505,8 @@ def build_story(items, src, instr_flowables):
         for f in fls:
             f.gid = gi
         GROUP_LABEL[gi] = next((f.text for f in fls if isinstance(f, QHead)), 'seção %d' % gi)
+        GROUP_H[gi] = (height_of([f for f in fls if not isinstance(f, PageBreak)], FRAME_W),
+                       bool(g.get('free') or g['red'] or any(isinstance(f, Fig) and f.mode not in ('normal', 'ajustada') for f in fls)))
         for f in fls:
             if isinstance(f, Fig) and f.vector:
                 f.info['questao'] = GROUP_LABEL[gi]
@@ -733,6 +737,9 @@ def pass2(src_path, content_path, out_path, npages, rp):
                            fontfile=fpath(BOLD_FILE), color=(0.137, 0.122, 0.125))
         pg.set_cropbox(pymupdf.Rect(O, O, O + W, O + H))
     out.insert_pdf(src, from_page=last_src, to_page=last_src)     # contracapa intacta
+    md = out.metadata or {}
+    md['producer'] = f'PSM Ampliação {VERSAO}'
+    out.set_metadata(md)
     out.save(out_path, garbage=3, deflate=True)
     return len(out)
 
@@ -945,6 +952,30 @@ def conferir(src_path, out_path, items, tipo, rp):
     add('Páginas: nenhuma em branco, nenhum texto fora da folha', not brancas and not fora_tx,
         'ok' if not (brancas or fora_tx) else f'em branco: {brancas}; texto fora: {sorted(set(fora_tx))}')
 
+    # 6b) quebras de questão: nunca em 3+ páginas; questão que cabe numa página não pode ser dividida
+    q3, qdesnec = [], []
+    for g, v in GROUP_PAGES.items():
+        ini, fim = v.get('ini'), v.get('fim')
+        if not ini or not fim or fim <= ini:
+            continue
+        alt, permitido = GROUP_H.get(g, (0, False))
+        nome = GROUP_LABEL.get(g, str(g)).replace('QUESTÃO ', 'Q')
+        if permitido:
+            continue
+        if fim - ini >= 2:
+            q3.append(f'{nome} (págs. {ini + 1}–{fim + 1})')
+        elif alt <= FRAME_H - 2:
+            qdesnec.append(f'{nome} (pág. {ini + 1})')
+    add('Quebras: nenhuma questão em 3+ páginas nem dividida sem necessidade', not q3 and not qdesnec,
+        'ok' if not (q3 or qdesnec) else '; '.join(x for x in (
+            ('em 3+ páginas: ' + ', '.join(q3)) if q3 else '',
+            ('caberia numa página só: ' + ', '.join(qdesnec)) if qdesnec else '') if x))
+
+    # 6c) nenhum "resto de diagramação" recortado como figura (abas laterais, filetes soltos)
+    finas = [f'pág. {pn + 1}' for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS if vec and (rect.width < 10 and rect.height > 10)]
+    add('Figuras: nenhuma aba/filete solto recortado como figura', not finas,
+        'ok' if not finas else 'conferir: ' + ', '.join(finas))
+
     # 7) folha de rascunho (só Prova I)
     if tipo['prova'] == 'I' and rp is not None:
         pgs = [p for p in range(1, len(out) - 1) if _eh_rascunho(out[p])]
@@ -1096,7 +1127,7 @@ def normalizar_pdf(pdf_bytes):
 def _reset():
     global TMP
     TMP = tempfile.mkdtemp(prefix='ampl_')
-    FIGS.clear(); PAGE_SRC.clear(); FRAME_Y.clear(); FRAME_X.clear(); GROUP_PAGES.clear(); NO_RULE_PAGES.clear(); WARN.clear()
+    FIGS.clear(); PAGE_SRC.clear(); FRAME_Y.clear(); FRAME_X.clear(); GROUP_PAGES.clear(); GROUP_H.clear(); NO_RULE_PAGES.clear(); WARN.clear()
     GROUP_LABEL.clear(); FIG_NOTES.clear(); BLOCOS.clear(); enem_parse.EXCL.clear()
 
 
