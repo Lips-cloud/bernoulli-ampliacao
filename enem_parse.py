@@ -112,6 +112,8 @@ def _is_decor(r, width_limit=548.5, dr=None):
         return True                                   # moldura/sangria/marcas de corte
     if r.x1 < 21 or r.x0 > width_limit:
         return True                                   # abas coloridas nas margens
+    if r.width < 10 and (r.x0 > 543 or r.x1 < 24):
+        return True                                   # aba/filete fino fora da coluna de texto (ex.: aba azul da lateral)
     if r.width < 1.5 and r.height > 300:
         return True                                   # fio de separação das colunas
     fill = dr.get('fill') if dr else None
