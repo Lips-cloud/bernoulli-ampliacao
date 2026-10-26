@@ -14,6 +14,7 @@ from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.lib.colors import Color, white
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.pdfmetrics import getAscentDescent
 from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph, KeepTogether,
                                 Flowable, PageBreak)
 from reportlab.platypus.flowables import CondPageBreak
@@ -21,7 +22,7 @@ from reportlab.platypus.flowables import CondPageBreak
 import enem_parse
 from enem_parse import build_items, load_page, Ln, find_rascunho_page
 
-VERSAO = '2026-10-26 v3 (quebras + frações no texto)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
+VERSAO = '2026-10-26 v4 (alternativas com fórmula)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
 S = 1.2                                   # fator de ampliação (corpo -> 12 pt)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_DIRS = [_HERE + os.sep, '/usr/share/fonts/truetype/crosextra/', '/usr/share/fonts/truetype/liberation/']
@@ -132,9 +133,9 @@ def markup(runs, src_doc, pno, text_scale=1.0):
         if not t:
             continue
         if r.get('pos') == 'sup':
-            t = f'<super size="{r.get("size", 6.5) * S:.1f}">{t}</super>'
+            t = f'<super size="{r.get("size", 6.5) * S:.1f}" rise="{4.2 * text_scale:.1f}">{t}</super>'
         elif r.get('pos') == 'sub':
-            t = f'<sub size="{r.get("size", 6.5) * S:.1f}">{t}</sub>'
+            t = f'<sub size="{r.get("size", 6.5) * S:.1f}" rise="{2.0 * text_scale:.1f}">{t}</sub>'
         if r.get('b'):
             t = f'<b>{t}</b>'
         if r.get('i'):
@@ -249,6 +250,34 @@ class SecBox(Flowable):
             c.drawString(self.pad_l, y, ln); y -= self.lead
 
 
+class TallParagraph(Paragraph):
+    """Parágrafo com imagem embutida mais alta que a linha (fração, raiz, símbolo):
+    o ReportLab desenha a 1ª linha a partir da altura normal da fonte e a imagem "vaza" para cima,
+    invadindo o que vem antes. Aqui a altura ganha esse excedente e o conteúdo desce junto."""
+    def wrap(self, aw, ah):
+        w, h = Paragraph.wrap(self, aw, ah)
+        ls = getattr(self.blPara, 'lines', None) or []
+        a0 = getattr(ls[0], 'ascent', 0) if ls else 0
+        try:
+            fa = getAscentDescent(self.style.fontName, self.style.fontSize)[0]
+        except Exception:
+            fa = self.style.fontSize * 0.75
+        self._extra = max(0.0, a0 - fa)
+        self.height = h + self._extra
+        return w, self.height
+
+    def drawOn(self, canv, x, y, _sW=0):
+        H = self.height
+        self.height = H - self._extra
+        try:
+            Paragraph.drawOn(self, canv, x, y, _sW)
+        finally:
+            self.height = H
+
+    def split(self, aw, ah):
+        return []
+
+
 class AltFlow(Flowable):
     """Alternativa com a letra em círculo preto (igual ao original)."""
     def __init__(self, letter, para):
@@ -267,7 +296,13 @@ class AltFlow(Flowable):
             GROUP_PAGES.setdefault(self.gid, {})['fim'] = c.getPageNumber()
         self.para.drawOn(c, self.IND, 0)
         asc = getattr(self.para.blPara, 'ascent', 12)
-        base = self.h - asc
+        ex = getattr(self.para, '_extra', 0.0)
+        if ex:                                   # 1ª linha com fórmula alta: centra o círculo na fórmula
+            ls = self.para.blPara.lines
+            a0, d0 = getattr(ls[0], 'ascent', asc), getattr(ls[0], 'descent', -3)
+            base = self.h - a0 + (a0 + d0) / 2 - 3.85
+        else:
+            base = self.h - asc
         r = 5.7
         cy = base + 3.85
         c.setFillColor(INK); c.circle(r, cy, r, stroke=0, fill=1)
@@ -406,7 +441,8 @@ def item_flowables(it, src, state):
         # recuo de primeira linha ou bloco antes de enunciado: mantém ritmo da prova
         if any(r.get('math') for r in runs):
             ex['autoLeading'] = 'max'
-        return [Paragraph(markup(runs, src, pno), ParagraphStyle('p', parent=ST_BODY, **ex))]
+        PC = TallParagraph if any('img' in r for r in runs) else Paragraph
+        return [PC(markup(runs, src, pno), ParagraphStyle('p', parent=ST_BODY, **ex))]
     if k == 'verse':
         txt = '<br/>'.join(markup(l, src, pno) for l in it['lines'])
         return [Paragraph(txt, ParagraphStyle('v', parent=ST_LEFT, leftIndent=it['left'] * S, spaceBefore=2, spaceAfter=2))]
@@ -422,7 +458,8 @@ def item_flowables(it, src, state):
         return [Fig(it['page'], it['rect'], FRAME_W, align='LEFT', is_alt=True, vector=True, tipo='alternativa')]
     if k == 'alt':
         al = {'autoLeading': 'max'} if any(r.get('math') for r in it['runs']) else {}
-        p = Paragraph(markup(it['runs'], src, pno), ParagraphStyle('a', parent=ST_ALT, spaceBefore=0, **al))
+        PC = TallParagraph if any('img' in r for r in it['runs']) else Paragraph
+        p = PC(markup(it['runs'], src, pno), ParagraphStyle('a', parent=ST_ALT, spaceBefore=0, **al))
         fl = AltFlow(it['letter'], p)
         if al:
             fl.spaceBefore = 4
