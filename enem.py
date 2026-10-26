@@ -21,7 +21,7 @@ from reportlab.platypus.flowables import CondPageBreak
 import enem_parse
 from enem_parse import build_items, load_page, Ln, find_rascunho_page
 
-VERSAO = '2026-10-26 v2 (quebras de figura)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
+VERSAO = '2026-10-26 v3 (quebras + frações no texto)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
 S = 1.2                                   # fator de ampliação (corpo -> 12 pt)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_DIRS = [_HERE + os.sep, '/usr/share/fonts/truetype/crosextra/', '/usr/share/fonts/truetype/liberation/']
@@ -105,11 +105,17 @@ def esc(t):
     return t.replace('\u2011', '-').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def emoji_png(rect, pno, src_doc, dpi=300):
-    key = hashlib.md5(f'{pno}{tuple(round(v,1) for v in rect)}{dpi}'.encode()).hexdigest()[:10]
+def emoji_png(rect, pno, src_doc, dpi=300, mask=()):
+    key = hashlib.md5(f'{pno}{tuple(round(v,1) for v in rect)}{dpi}{[tuple(round(v,1) for v in m) for m in mask]}'.encode()).hexdigest()[:10]
     path = os.path.join(TMP, f'emo_{key}.png')
     if not os.path.exists(path):
         pix = src_doc[pno].get_pixmap(clip=rect, dpi=dpi)
+        k = dpi / 72.0
+        for m in mask:                       # apaga letras de outra linha que invadem o recorte
+            ir = pymupdf.IRect(int(m.x0 * k) - 1, int(m.y0 * k) - 1,
+                               int(m.x1 * k) + 2, int(m.y1 * k) + 1) & pix.irect    # pixmap de recorte usa coordenadas da página
+            if not ir.is_empty:
+                pix.set_rect(ir, (255,) * pix.n)
         pix.save(path)
     return path
 
@@ -119,7 +125,7 @@ def markup(runs, src_doc, pno, text_scale=1.0):
     for r in runs:
         if 'img' in r:
             rect = r['img']
-            p = emoji_png(rect, pno, src_doc, 500 if r.get('math') else 300)
+            p = emoji_png(rect, pno, src_doc, 500 if r.get('math') else 300, r.get('mask', ()))
             out.append(f'<img src="{p}" width="{rect.width*S:.1f}" height="{rect.height*S:.1f}" valign="middle"/>')
             continue
         t = esc(r['t'].strip() if r.get('pos') else r['t']).replace('\n', '<br/>')
@@ -972,8 +978,8 @@ def conferir(src_path, out_path, items, tipo, rp):
             ('caberia numa página só: ' + ', '.join(qdesnec)) if qdesnec else '') if x))
 
     # 6c) nenhum "resto de diagramação" recortado como figura (abas laterais, filetes soltos)
-    finas = [f'pág. {pn + 1}' for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS if vec and (rect.width < 10 and rect.height > 10)]
-    add('Figuras: nenhuma aba/filete solto recortado como figura', not finas,
+    finas = [f'pág. {pn + 1}' for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS if vec and ((rect.width < 10 and rect.height > 10) or rect.height < 4)]
+    add('Figuras: nenhuma aba, filete ou barra de fração solta recortada como figura', not finas,
         'ok' if not finas else 'conferir: ' + ', '.join(finas))
 
     # 7) folha de rascunho (só Prova I)
