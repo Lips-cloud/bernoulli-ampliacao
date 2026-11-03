@@ -671,7 +671,7 @@ def build_items(doc, pages):
         flush()
         buf = dict(kind=kind, lines=[(e, left, right)])
     flush()
-    return _alternativas_em_linha(_formulas_no_texto(items, doc), doc)
+    return _alternativas_em_linha(_formulas_no_texto(_juntar_figuras(items, doc), doc), doc)
 
 
 def _formulas_no_texto(items, doc):
@@ -735,6 +735,61 @@ def _formulas_no_texto(items, doc):
             ind = tira.x0 - cl if tira.x0 - cl > 8 else 0.0
             out.append(dict(k='para', runs=[img], indent=ind, left=0.0, justify=False, src=it['src'], nlines=1, center=False))
     return out
+
+
+def _juntar_figuras(items, doc):
+    """Uma figura só que o arquivo guarda em pedaços (imagem fatiada em 2 ou 3 blocos encostados) ou
+    duas figuras lado a lado com legenda embaixo (ex.: 'Solo bem estruturado' | 'Solo compactado')
+    viram UMA figura — senão saem empilhadas, separadas da legenda ou em páginas diferentes."""
+    def encostadas(a, b):
+        tol = 3.0
+        sy = min(a.y1, b.y1) - max(a.y0, b.y0)
+        sx = min(a.x1, b.x1) - max(a.x0, b.x0)
+        if a.intersects(b) and sx > 0 and sy > 0:
+            return True
+        lado = (abs(a.x1 - b.x0) <= tol or abs(b.x1 - a.x0) <= tol) and sy >= 0.5 * min(a.height, b.height)
+        cima = (abs(a.y1 - b.y0) <= tol or abs(b.y1 - a.y0) <= tol) and sx >= 0.5 * min(a.width, b.width)
+        return lado or cima
+
+    def pareadas(a, b):
+        gap = max(b.x0 - a.x1, a.x0 - b.x1)
+        return (0 <= gap <= 15 and abs(a.y0 - b.y0) <= 6 and
+                abs(a.height - b.height) <= 0.25 * max(a.height, b.height))
+
+    out = []
+    for it in items:
+        prev = out[-1] if out else None
+        if (it.get('k') == 'fig' and prev is not None and prev.get('k') == 'fig' and prev.get('page') == it.get('page')
+                and (encostadas(prev['rect'], it['rect']) or pareadas(prev['rect'], it['rect']))):
+            par = pareadas(prev['rect'], it['rect'])
+            prev['rect'] = pymupdf.Rect(prev['rect']) | it['rect']
+            prev['vector'] = bool(prev.get('vector') or it.get('vector'))
+            prev['_par'] = prev.get('_par') or par
+            continue
+        out.append(it)
+    # legendas curtas logo abaixo de figuras pareadas entram no recorte
+    res = []
+    for it in out:
+        prev = res[-1] if res else None
+        if it.get('k') == 'para' and prev is not None and prev.get('k') == 'fig' and prev.get('_par') \
+                and it.get('nlines', 1) == 1 and it.get('src') == prev.get('page'):
+            txt = ''.join(r.get('t', '') for r in it.get('runs', [])).strip()
+            R = prev['rect']
+            yb = prev.setdefault('_y1fig', R.y1)            # base da figura (antes de somar legendas)
+            hit = None
+            if 0 < len(txt) <= 45:
+                for h in doc[prev['page']].search_for(txt):
+                    if yb - 3 <= h.y0 <= yb + 22 and h.x0 >= R.x0 - 5 and h.x1 <= R.x1 + 5:
+                        hit = h
+                        break
+            if hit is not None:
+                prev['rect'] = pymupdf.Rect(R) | pymupdf.Rect(hit.x0 - 1, hit.y0 - 1, hit.x1 + 1, hit.y1 + 1)
+                prev['vector'] = True                       # legenda é texto: o recorte precisa mantê-lo
+                continue
+        res.append(it)
+    for it in res:
+        it.pop('_par', None); it.pop('_y1fig', None)
+    return res
 
 
 def _alternativas_em_linha(items, doc):
