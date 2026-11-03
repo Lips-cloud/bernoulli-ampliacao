@@ -1,166 +1,986 @@
 # -*- coding: utf-8 -*-
-"""PSM Ampliação — app Streamlit (perfis ENEM PPL 2025 e ENEM 2026). Fluxo em duas etapas: 1) analisar  2) gerar."""
-import hashlib
+"""
+PSM-Inclusão / Ampliação — parte 1: leitura estrutural de um caderno ENEM em layout fechado.
+
+Lê o texto VIVO do PDF (sem OCR), reconstrói a sequência de itens (cabeçalho de questão,
+parágrafo, verso, legenda, figura, alternativa...) na ordem de leitura (coluna esquerda -> direita).
+"""
+import os, re, statistics
 import pymupdf
-import streamlit as st
-from enem import analisar, ampliar, PERFIS as PERFIS_MOTOR, detectar_perfil, VERSAO
 
-st.set_page_config(page_title="PSM Ampliação", page_icon="🔎", layout="centered")
-st.title("PSM Ampliação")
-st.caption(f"Amplia provas em PDF de layout fechado para alunos com baixa visão. — motor {VERSAO}")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FD = _HERE + os.sep if os.path.exists(os.path.join(_HERE, 'Carlito-Regular.ttf')) else '/usr/share/fonts/truetype/crosextra/'
+_METRIC = {}
 
-AUTO = "Detectar automaticamente"
-OPCOES = [AUTO] + [PERFIS_MOTOR[k]["rotulo"] for k in PERFIS_MOTOR] + [
-    "Bahiana (em breve)", "SBAHIA 2E (em breve)", "Módulo (em breve)", "A4 Bernoulli (em breve)", "Itinerários (em breve)"]
-escolha = st.selectbox("Perfil da prova", OPCOES)
-if escolha.endswith("(em breve)"):
-    st.info("Este perfil ainda não foi implementado. Por enquanto: ENEM 2026, ENEM PPL 2025 e EM – Simulado Ensino Médio.")
-    st.stop()
-perfil_escolhido = None if escolha == AUTO else next(k for k, v in PERFIS_MOTOR.items() if v["rotulo"] == escolha)
+# parâmetros do perfil (preenchidos por set_profile)
+K = 1.0                       # tamanho do corpo / 10 pt (ENEM PPL = 1.0; ENEM 2026 = 0.9)
+CIRC_FONTS = ('bundesbahn',)  # fonte do marcador de alternativa
+FONT_FILES = {(False, False): 'Carlito-Regular.ttf', (True, False): 'Carlito-Bold.ttf',
+              (False, True): 'Carlito-Italic.ttf', (True, True): 'Carlito-BoldItalic.ttf'}
+QCODE = False                 # cabeçalho de questão com código alfanumérico à direita
 
-with st.expander("Regras aplicadas"):
-    st.markdown(
-        "- Texto do corpo ampliado para **12 pt** (ENEM 2026: Arial 9 → 12 pt, fator 1,33; ENEM PPL: Calibri 10 → 12 pt, fator 1,2), "
-        "em coluna única.\n"
-        "- Imagens e figuras ampliadas **na mesma proporção do texto** (recorte exato do original).\n"
-        "- Figura que **não cabe na página ampliada**: o app tenta **girar 90°**. Se girada também não chegar à ampliação, "
-        "a figura fica **sozinha na página** (com crédito/fonte) e o restante da questão segue na página seguinte, "
-        "para você girar/ajustar à mão sem mexer em mais nada.\n"
-        "- **Tabelas, gráficos, esquemas, equações e alternativas com fração/raiz** são tratados como **imagem**: "
-        "o app recorta o bloco do PDF original e amplia na mesma proporção (sem tentar reconstruir como texto). "
-        "Fração ou raiz no meio de um parágrafo vira uma pequena imagem dentro da linha. "
-        "Subscritos e sobrescritos (CO₂, 10⁹) continuam sendo texto.\n"
-        "- **Prova I** (questões 1–90, com inglês/espanhol e redação) e **Prova II** (91–180) são identificadas "
-        "pela numeração. Na Prova I, a **folha de rascunho da redação** é ampliada e sai em **2 páginas** "
-        "(linhas 1–15 e 16–30), depois da página de instruções.\n"
-        "- **Capa e contracapa não mudam.**\n"
-        "- **Cabeçalho e rodapé** do original mantidos em todas as páginas (só o número da página é renumerado).\n"
-        "- **Corte e sangria:** o app sempre trabalha pelo **tamanho final (corte)**. Se o PDF vier no tamanho final, "
-        "com sangria/marcas ou sem TrimBox, ele padroniza a página sozinho; se o formato for incompatível com o perfil, avisa.\n"
-        "- Figura larga demais para 1,2×: entra **junto com a questão**, na maior escala que cabe na largura "
-        "(nunca menor que o original). Só gira ou fica sozinha se fosse ficar menor que o original.\n"
-        "- **Nenhuma questão é quebrada** entre páginas. Só se ela for maior que uma página inteira, "
-        "quebra entre o texto-base e o enunciado+alternativas.\n"
-        "- Nenhum texto é redigitado: o app usa o texto vivo do PDF e confere, caractere a caractere, "
-        "que nada foi perdido ou acrescentado.")
 
-arq = st.file_uploader("PDF da prova (layout fechado do ENEM)", type=["pdf"])
-if not arq:
-    st.stop()
+def TS(x):
+    """Limiar de tamanho (pt) ajustado ao corpo do perfil."""
+    return x * K
 
-dados = arq.getvalue()
-chave = hashlib.md5(dados).hexdigest() + str(perfil_escolhido)
-if st.session_state.get("chave") != chave:
-    st.session_state.clear()
-    st.session_state["chave"] = chave
 
-# ------------------------------------------------------------ etapa 1
-st.subheader("Etapa 1 — Análise")
-if st.button("Analisar prova"):
-    with st.spinner("Lendo a estrutura do PDF..."):
-        try:
-            st.session_state["analise"] = analisar(dados, perfil_escolhido)
-        except Exception as e:                                   # noqa
-            st.session_state.pop("analise", None)
-            st.error(f"Não consegui ler este PDF: {e}")
+def set_profile(k=1.0, circ_fonts=('bundesbahn',), font_files=None, body_top=75.0, body_bot=744.0, qcode=False):
+    global K, CIRC_FONTS, FONT_FILES, BODY_TOP, BODY_BOT, QCODE
+    K, CIRC_FONTS, QCODE = k, tuple(circ_fonts), qcode
+    BODY_TOP, BODY_BOT = body_top, body_bot
+    if font_files:
+        FONT_FILES = font_files
+    _METRIC.clear()
 
-a = st.session_state.get("analise")
-if a:
-    st.write(f"**Perfil:** {a['perfil_rotulo']}" + (" (detectado automaticamente)" if perfil_escolhido is None else ""))
-    cx = a["caixas"]
-    (st.success if cx["situacao"] == "ok" else st.warning)(
-        f"Página: {cx['mensagem']} (página inteira {cx['media'][0]} × {cx['media'][1]} pt)")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Páginas", a["paginas"])
-    c2.metric("Questões", a["questoes_blocos"])
-    c3.metric("Alternativas", a["alternativas"])
-    c4.metric("Figuras", a["figuras"])
-    if a["alternativas"] != a["alternativas_esperadas"]:
-        st.warning(f"Atenção: {a['alternativas']} alternativas encontradas, mas {a['alternativas_esperadas']} "
-                   "seriam esperadas (5 por questão). Confira o PDF antes de gerar.")
-    else:
-        st.success("Estrutura consistente: 5 alternativas para cada questão detectada.")
-    if a["prova"]:
-        q0, q1 = a["faixa_questoes"]
-        extra = " (inglês/espanhol nas questões 1–5)" if a["ingles_espanhol"] else ""
-        st.write(f"**Prova {a['prova']}** — questões {q0} a {q1}{extra}.")
-    for av in a["avisos"]:
-        st.warning(av)
-    if a["pagina_rascunho"]:
-        st.write(f"Página de instruções/rascunho da redação no original: página {a['pagina_rascunho']}. "
-                 f"No ampliado: instruções em página própria + {a['paginas_rascunho_saida']} páginas de rascunho.")
-    else:
-        st.write("Sem página de redação neste caderno.")
-    if a["questoes_divididas"]:
-        st.info("Questões grandes demais para uma página a 12 pt (serão divididas entre o texto-base e o "
-                "enunciado+alternativas): " + ", ".join(f"{q} ({h} pt)" for q, h in a["questoes_divididas"]))
-    else:
-        st.write("Nenhuma questão estoura uma página.")
-    if a.get("blocos_imagem"):
-        qs = sorted({b["questao"] for b in a["blocos_imagem"] if b.get("questao")})
-        st.info(f"{len(a['blocos_imagem'])} bloco(s) serão tratados como imagem (tabelas, gráficos, fórmulas, "
-                f"alternativas com fração/raiz) em {len(qs)} questão(ões): " + ", ".join(q.replace("QUESTÃO ", "") for q in qs))
-    if a.get("inline_imagens"):
-        st.info("Frações/raízes dentro de parágrafos viram imagem pequena na linha (páginas do original: "
-                + ", ".join(str(p) for p in a["inline_imagens"]) + ").")
-    for f in a["figuras_revisao"]:
-        if f["modo"] == "girada":
-            st.info(f"{f['questao']}: figura grande demais na posição normal; será **girada 90°** e ampliada na proporção do texto "
-                    "(página própria para a figura).")
+
+def _metric(bold, italic):
+    k = (bold, italic)
+    if k not in _METRIC:
+        _METRIC[k] = pymupdf.Font(fontfile=_FD + FONT_FILES[k])
+    return _METRIC[k]
+
+
+def span_text(sp):
+    """Texto do span (rawdict) já corrigido: o InDesign guarda 'Caixa Alta'/'Capitalizar' como minúsculas
+    no texto e só muda o desenho; aqui comparamos a largura de cada glifo com a de maiúscula/minúscula."""
+    chars = sp['chars']
+    raw = ''.join(c['c'] for c in chars)
+    f = sp['font'].lower()
+    if any(k in f for k in ('symbol', 'euclid', 'bundesbahn', 'teste', 'times')) or not any(c.isalpha() for c in raw):
+        return raw
+    font = _metric('bold' in f, 'italic' in f)
+    out, certain = [], []
+    for c in chars:
+        ch = c['c']; w = c['bbox'][2] - c['bbox'][0]
+        up = False
+        if ch.isalpha() and ch.lower() != ch.upper():
+            wl, wu = font.text_length(ch.lower(), sp['size']), font.text_length(ch.upper(), sp['size'])
+            if abs(wu - wl) > 0.04 * sp['size']:
+                up = abs(w - wu) < abs(w - wl)
+                certain.append(True)
+                ch = ch.upper() if up else ch.lower()
+            else:
+                certain.append(False)
         else:
-            st.warning(f"{f['questao']}: figura não chega à ampliação do texto nem girada. Ficará **sozinha na página** a "
-                       f"{f['escala']:.2f}× (girada chegaria a {f['escala_girada']}×) — **revisão manual**.")
-
-    # -------------------------------------------------------- etapa 2
-    st.subheader("Etapa 2 — Geração")
-    if st.button("Gerar PDF ampliado", type="primary"):
-        barra = st.progress(0.0, text="Iniciando...")
-        try:
-            r = ampliar(dados, lambda p, m: barra.progress(p, text=m), perfil_escolhido)
-            st.session_state["resultado"] = r
-        except Exception as e:                                   # noqa
-            st.session_state.pop("resultado", None)
-            st.error(f"Erro ao gerar: {e}")
-        barra.empty()
-
-r = st.session_state.get("resultado")
-if r:
-    aud = r["auditoria"]
-    c1, c2 = st.columns(2)
-    c1.metric("Páginas (original)", r["paginas_entrada"])
-    c2.metric("Páginas (ampliado)", r["paginas_saida"])
-    if r.get("perfil") == "em":
-        serie = f"{r['serie']}ª série" if r.get("serie") else "série não identificada (usando a cor da 1ª série)"
-        verso = ("conteúdo começa na pág. 3 (verso da capa em branco)" if r.get("paginas_em_branco_apos_capa")
-                 else "conteúdo começa na pág. 2 (sem verso em branco, para a folha de rascunho abrir par-ímpar)")
-        st.info(f"EM – {serie}; {verso}.")
-    for av in r["avisos"]:
-        st.warning(av)
-    if r["conferencia_ok"]:
-        st.success("Conferência final: todas as checagens passaram.")
-    else:
-        st.error("A conferência final encontrou problemas. NÃO use este PDF sem conferir os itens em vermelho.")
-    for c in r["checagens"]:
-        st.markdown(f"{'✅' if c['ok'] else '❌'} **{c['nome']}** — {c['detalhe']}")
-    if r["questoes_divididas"]:
-        st.info("Questões divididas entre páginas: " + ", ".join(r["questoes_divididas"]))
-    else:
-        st.write("Nenhuma questão foi dividida entre páginas.")
-    if r.get("blocos_imagem"):
-        st.caption(f"Blocos tratados como imagem: {len(r['blocos_imagem'])} — confira na prévia as tabelas, gráficos e fórmulas.")
-    for f in r["figuras_revisao"]:
-        if f["modo"] == "girada":
-            st.info(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura girada 90°.")
+            certain.append(False)
+        out.append(ch)
+    # palavra com 2+ maiúsculas certas: as letras ambíguas (e/E, o/O...) também são maiúsculas
+    res = list(out)
+    i = 0
+    while i < len(res):
+        if res[i].isalpha():
+            j = i
+            while j < len(res) and res[j].isalpha():
+                j += 1
+            ups = sum(1 for k in range(i, j) if certain[k] and res[k].isupper())
+            if ups >= 2:
+                for k in range(i, j):
+                    if not certain[k]:
+                        res[k] = res[k].upper()
+            i = j
         else:
-            st.warning(f"{f['questao']} (pág. {f['pagina_saida']} do ampliado): figura sozinha na página a "
-                       f"{f['escala']}× — **girar/ajustar manualmente**.")
-    st.caption("Não verificado automaticamente: o aspecto visual de cada página. Confira a prévia abaixo.")
+            i += 1
+    return ''.join(res)
 
-    nome = arq.name.rsplit(".", 1)[0] + "_AMPLIADO_fonte12.pdf"
-    st.download_button("Baixar PDF ampliado", r["pdf"], file_name=nome, mime="application/pdf")
+BODY_TOP, BODY_BOT = 75.0, 744.0        # faixa útil da página (entre os filetes pontilhados)
+BOX_R = 0.752                            # cor de preenchimento das caixas ciano de seção
 
-    with st.expander("Prévia das páginas"):
-        doc = pymupdf.open(stream=r["pdf"], filetype="pdf")
-        n = st.slider("Página", 1, len(doc), 2)
-        pix = doc[n - 1].get_pixmap(dpi=80)
-        st.image(pix.tobytes("png"), caption=f"Página {n} de {len(doc)}")
+
+class Ln:
+    """Uma linha de texto do PDF original."""
+    def __init__(s, **k):
+        s.__dict__.update(k)
+    def text(s):
+        return ''.join(r.get('t', '') for r in s.parts)
+
+
+def _style(font):
+    f = font.lower()
+    return ('bold' in f, 'italic' in f)
+
+
+KEEP = {}      # (pág, rect arredondado) -> caixas do texto que pertence ao bloco vetorial
+EXCL = []      # (página, retângulo) de trechos que viram imagem dentro do parágrafo
+SYM_MAP = {'p': 'π', '\u22c5': '\u00b7'}          # SymbolMT: 'p' = pi ; ponto-médio matemático -> U+00B7
+SAFE_SYMBOL = set('+<=>×σΩ→−≤≥⋅°·.,;:()[]%/ ' + '0123456789')
+
+
+def _is_decor(r, width_limit=548.5, dr=None):
+    """Desenho que faz parte da diagramação (filetes, barra da questão, caixa de seção, abas laterais)."""
+    if r.x0 < -1 or r.y0 < -1 or r.x1 > 569.5 or r.y1 > 782 or r.width > 560 or r.height > 700:
+        return True                                   # moldura/sangria/marcas de corte
+    if r.x1 < 21 or r.x0 > width_limit:
+        return True                                   # abas coloridas nas margens
+    if r.width < 10 and (r.x0 > 543 or r.x1 < 24):
+        return True                                   # aba/filete fino fora da coluna de texto (ex.: aba azul da lateral)
+    if r.width < 1.5 and r.height > 300:
+        return True                                   # fio de separação das colunas
+    fill = dr.get('fill') if dr else None
+    col = dr.get('color') if dr else None
+    if dr is None and r.width > 150 and 18 < r.height < 60 and r.x0 < 60:
+        return True
+    if fill and r.width > 150 and 10 < r.height < 60 and ((fill[2] > 0.97 and fill[0] > 0.7) or abs(fill[0] - BOX_R) < 0.01):
+        return True                                   # caixa de seção (qualquer coluna)
+    if col and r.width < 5 and 10 < r.height < 60 and col[2] > 0.9 and (dr.get('width') or 0) >= 2.5:
+        return True                                   # barra lateral da caixa de seção
+    if r.y1 < BODY_TOP + 1 or r.y0 > BODY_BOT - 1:
+        return True
+    return False
+
+
+def _clusters(rects, gap=2.0, with_members=False):
+    """Une retângulos que se tocam (distância <= gap)."""
+    def _fat(r):                                      # linhas têm largura/altura 0: o Rect do PyMuPDF as ignora na união
+        return pymupdf.Rect(r.x0 - 0.3, r.y0 - 0.3, r.x1 + 0.3, r.y1 + 0.3)
+    cl = [(_fat(r), [_fat(r)]) for r in rects]
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        for r, ms in cl:
+            for o in out:
+                if not (r.x1 + gap < o[0].x0 or o[0].x1 + gap < r.x0 or r.y1 + gap < o[0].y0 or o[0].y1 + gap < r.y0):
+                    o[0] |= r
+                    o[1].extend(ms)
+                    changed = True
+                    break
+            else:
+                out.append([pymupdf.Rect(r), list(ms)])
+        cl = out
+    return cl if with_members else [c[0] for c in cl]
+
+
+def _inside(r, bg, tol=3.0):
+    return bg.x0 - tol <= r.x0 and r.x1 <= bg.x1 + tol and bg.y0 - tol <= r.y0 and r.y1 <= bg.y1 + tol
+
+
+def _vov(a, b):
+    return min(a[3], b[3]) - max(a[1], b[1])
+
+
+def _hov(a, b):
+    return min(a[2], b[2]) - max(a[0], b[0])
+
+
+def _is_prose(ln):
+    t = ln.text().strip()
+    words = re.findall(r'[A-Za-zÀ-ÿ]{4,}', t)
+    return ln.size >= TS(9.0) and len(t) >= 25 and len(words) >= 3 and not any(p.get('circ') for p in ln.parts[:1])
+
+
+def load_page(doc, pno):
+    """Retorna elementos ordenados: Ln | fig(dict). Blocos complexos (tabelas, gráficos, fórmulas, frações,
+    raízes) viram 'fig' vetorial; linhas de parágrafo que os contêm ficam marcadas (taint)."""
+    page = doc[pno]
+    drs = page.get_drawings()
+    rules = [dr['rect'].x0 for dr in drs if dr['rect'].width < 1 and dr['rect'].height > 300]
+    gutter = rules[0] if rules else None
+    boxes = [dr['rect'] for dr in drs if dr.get('fill') and dr['rect'].height > 8 and dr['rect'].width > 100
+             and ((abs(dr['fill'][0] - BOX_R) < 0.01) or (dr['fill'][2] > 0.97 and dr['fill'][0] > 0.85 and dr['rect'].width > 150))]
+    raw = page.get_text('rawdict')
+
+    imgs, lines = [], []
+    for blk in raw['blocks']:
+        if blk['type'] == 1:
+            imgs.append(pymupdf.Rect(blk['bbox']))
+            continue
+        for l in blk['lines']:
+            x0, y0, x1, y1 = l['bbox']
+            if y0 < BODY_TOP or y0 >= BODY_BOT:
+                continue
+            spans = [s for s in l['spans'] if s['chars']]
+            if not spans:
+                continue
+            if max(s['size'] for s in spans) > 30:      # marca d'água "RASCUNHO"
+                continue
+            lines.append((l, spans))
+
+    big = [r for r in imgs if r.width > 24 or r.height > 24]
+    small = [r for r in imgs if not (r.width > 24 or r.height > 24)]
+
+    # 1) fragmentos de linha
+    frags = []
+    for l, spans in lines:
+        x0, y0, x1, y1 = l['bbox']
+        parts = []
+        weird = False
+        rotated = abs(l['dir'][0]) < 0.9
+        for sp in spans:
+            b, i = _style(sp['font'])
+            fl = sp['font'].lower()
+            circ = any(cf in fl for cf in CIRC_FONTS)
+            txt = span_text(sp)
+            if 'symbol' in fl:
+                txt = ''.join(SYM_MAP.get(c, c) for c in txt)
+                if any((ord(c) < 32) or (0xE000 <= ord(c) <= 0xF8FF) or (c.isascii() and c.isalpha()) for c in txt):
+                    weird = True
+            elif 'euclid' in fl:
+                weird = True
+            parts.append(dict(x=sp['bbox'][0], x1=sp['bbox'][2], t=txt, b=b, i=i, size=sp['size'], circ=circ, oy=sp['origin'][1],
+                              ch=([(c['c'], c['bbox'][0], c['bbox'][2]) for c in sp['chars']] if len(txt) == len(sp['chars']) else None)))
+        wide = gutter is not None and x0 < gutter - 3 and x1 > gutter + 3
+        if gutter is None or wide:
+            grp = 0
+        else:
+            grp = 1 if (x0 + x1) / 2 < gutter else 2
+        frags.append(dict(x0=x0, y0=y0, x1=x1, y1=y1, parts=parts, grp=grp, wide=wide, weird=weird, rot=rotated))
+    def _base(f):
+        ss = [p['size'] for p in f['parts'] if p.get('t', '').strip()]
+        mx = max(ss) if ss else TS(10.0)
+        main = [p for p in f['parts'] if p.get('t', '').strip() and p['size'] >= mx - 0.8]
+        if not main:
+            return f['y1']
+        return max(main, key=lambda p: len(p['t'].strip()))['oy']      # a linha de base é a do trecho mais longo
+    for f in frags:
+        f['base'] = _base(f)
+    # funde fragmentos que estão na mesma linha de base (o PDF parte a linha em torno de emojis/sup/sub)
+    frags.sort(key=lambda f: (f['grp'], f['base'], f['x0']))
+    buckets = []
+    for f in frags:
+        bk = buckets[-1] if buckets else None
+        if bk and bk[0]['grp'] == f['grp'] and not f['rot'] and not bk[0]['rot'] and abs(f['base'] - bk[0]['base']) < 1.2:
+            bk.append(f)
+        else:
+            buckets.append([f])
+    merged = []
+    for bk in buckets:
+        bk.sort(key=lambda f: f['x0'])
+        m = None
+        for f in bk:
+            if m is not None and -12 <= f['x0'] - m['x1'] < 40 and f['x0'] > m['x0']:
+                m['parts'] += f['parts']; m['x1'] = max(m['x1'], f['x1']); m['y0'] = min(m['y0'], f['y0'])
+                m['y1'] = max(m['y1'], f['y1']); m['weird'] = m['weird'] or f['weird']
+            else:
+                m = dict(f); merged.append(m)
+    merged.sort(key=lambda f: (f['grp'], round(f['y0']), f['x0']))
+    if QCODE:
+        def _txt(f):
+            return ''.join(p.get('t', '') for p in f['parts']).strip()
+        for q in [f for f in merged if re.match(r'^QUEST[ãÃ]O\s+\d+', _txt(f), re.I)]:
+            for f in list(merged):
+                if f is q or f['grp'] != q['grp'] or f['rot']:
+                    continue
+                if re.match(r'^[A-Z0-9]{4}$', _txt(f)) and abs(f['base'] - q['base']) < 4 and f['x0'] > q['x1'] \
+                        and max((p['size'] for p in f['parts'] if p.get('t', '').strip()), default=99) <= TS(8.5):
+                    q['parts'] += f['parts']; q['x1'] = max(q['x1'], f['x1']); merged.remove(f)
+
+    # 2) subscritos/sobrescritos soltos (linhas pequenas) são anexados à linha-base
+    def base_size(f):
+        ss = [p['size'] for p in f['parts'] if p.get('t', '').strip()]
+        return max(ss) if ss else TS(10.0)
+    smalls = [f for f in merged if base_size(f) <= TS(7.6) and not f['rot']]
+    keep = [f for f in merged if f not in smalls]
+    for sm in smalls:
+        cx = (sm['x0'] + sm['x1']) / 2
+        best, bd = None, 99
+        for b in keep:
+            if b['grp'] != sm['grp'] and not (b['wide'] or sm['wide']) or b['rot'] or base_size(b) < TS(8):
+                continue
+            if b['x0'] - 1.5 <= cx <= b['x1'] + 1.5:
+                dy = (sm['y0'] + sm['y1']) / 2 - (b['y0'] + b['y1']) / 2
+                if abs(dy) < 9 and abs(dy) < bd:
+                    best, bd = b, abs(dy)
+        if best is not None:
+            best['parts'] += sm['parts']; best['x1'] = max(best['x1'], sm['x1'])
+            best['y0'] = min(best['y0'], sm['y0']); best['y1'] = max(best['y1'], sm['y1'])
+            best['weird'] = best['weird'] or sm['weird']
+        else:
+            keep.append(sm)
+    merged = keep
+
+    # 2b) imagens pequenas na mesma linha de texto (ex.: hieróglifos ao lado da letra da alternativa) entram na linha
+    still_big = []
+    for r in big:
+        host, bd = None, 99
+        if r.height <= 42 and r.width <= 170:
+            cyr = (r.y0 + r.y1) / 2
+            for f in merged:
+                if f['rot']:
+                    continue
+                if f['y0'] - 1 <= cyr <= f['y1'] + 1 or (r.y0 <= (f['y0'] + f['y1']) / 2 <= r.y1):
+                    gap = r.x0 - f['x1']
+                    inside = f['x0'] <= r.x0 <= f['x1']
+                    if (-5 <= gap < 30 or inside):
+                        dy = abs(cyr - (f['y0'] + f['y1']) / 2)
+                        if dy < bd:
+                            host, bd = f, dy
+        if host is not None:
+            host['parts'].append(dict(x=r.x0, x1=r.x1, img=r, math=True))
+            host['x1'] = max(host['x1'], r.x1)
+        else:
+            still_big.append(r)
+    big = still_big
+
+    # 3) blocos complexos: clusters de desenho + linhas "estranhas" + linhas rotacionadas
+    cl = _clusters([dr['rect'] for dr in drs if not _is_decor(dr['rect'], dr=dr) and (dr['rect'].width > 0 or dr['rect'].height > 0)],
+                   gap=1.5, with_members=True)
+    anchors = []
+    for rect, ms in cl:
+        if max(rect.width, rect.height) < 3.0 or (max(rect.width, rect.height) < 8 and min(rect.width, rect.height) >= 3):
+            continue                                   # anéis de grau, pontos etc. (barras de fração finas ficam)
+        if rect.width > 60 and all(m.height < 6 for m in ms) and (rect.width > 150 or rect.height >= 1.8):
+            continue                                   # só filetes (barra da questão, linha de fim de bloco)
+        if any(_inside(rect, bg) for bg in big):
+            continue                                   # desenho sobre uma figura raster: o recorte da figura já o leva
+        anchors.append(pymupdf.Rect(rect))
+    for f in merged:
+        if f['weird'] or f['rot']:
+            anchors.append(pymupdf.Rect(f['x0'], f['y0'], f['x1'], f['y1']))
+    anchors = _clusters(anchors, gap=1.0)
+
+    cache = {}
+
+    def get_ln(k):
+        if k not in cache:
+            cache[k] = _make_ln(merged[k], pno, gutter, boxes, small)
+        return cache[k]
+
+    consumed = set()          # linhas que saem do fluxo (viram parte de uma imagem)
+    in_region = set()
+    block_figs = []
+
+    def prose_f(f):
+        t = ''.join(p.get('t', '') for p in f['parts']).strip()
+        first = min(f['parts'], key=lambda p: p['x']) if f['parts'] else {}
+        return (base_size(f) >= TS(9.0) and len(t) >= 25 and len(re.findall(r'[A-Za-zÀ-ÿ]{4,}', t)) >= 3
+                and not first.get('circ'))
+
+    def is_alt_letter(f):
+        ts = ''.join(p.get('t', '') for p in f['parts']).strip()
+        first = min(f['parts'], key=lambda p: p['x']) if f['parts'] else {}
+        return bool(first.get('circ')) and len(ts) <= 10
+
+    bars = [pymupdf.Rect(dr['rect'].x0, dr['rect'].y0 - 0.3, dr['rect'].x1, dr['rect'].y1 + 0.3) for dr in drs
+            if not _is_decor(dr['rect'], dr=dr) and dr['rect'].height < 2 and 5 <= dr['rect'].width < 150]
+    tbox = [tight_box(f) for f in merged]
+    claimed = []
+    anchors.sort(key=lambda r: -(r.width * r.height))      # blocos grandes primeiro
+
+    for a0 in anchors:
+        if any(c.x0 - 1 <= a0.x0 and a0.x1 <= c.x1 + 1 and c.y0 - 1 <= a0.y0 and a0.y1 <= c.y1 + 1 for c in claimed):
+            continue                                          # já faz parte de um bloco maior
+        if any(ep == pno and er.x0 - 1 <= a0.x0 and a0.x1 <= er.x1 + 1 and er.y0 - 1 <= a0.y0 and a0.y1 <= er.y1 + 1
+               for ep, er in EXCL):
+            continue                                          # barra de fração que já entrou na imagem da linha
+        T = pymupdf.Rect(a0)                                  # retângulo justo do bloco
+        R = pymupdf.Rect(a0)                                  # área de busca de membros
+        a_bars = [bb for bb in bars if not (bb.x1 < a0.x0 - 1 or bb.x0 > a0.x1 + 1 or bb.y1 < a0.y0 - 1 or bb.y0 > a0.y1 + 1)]
+        thin = bool(a_bars) and a0.height < 40                 # âncora com barra(s) de fração
+        seed_rem = pymupdf.Rect(a0)
+        for bb in (a_bars if thin else []):
+            vv = 13 if bb.width >= 20 else 8                   # frações altas de alternativas precisam de mais folga
+            R |= pymupdf.Rect(bb.x0 - 1, bb.y0 - vv, bb.x1 + 1, bb.y1 + vv)
+            seed_rem |= pymupdf.Rect(bb.x0 - 1, bb.y0 - 8, bb.x1 + 1, bb.y1 + 8)
+        chart_like = a0.width > 60 and a0.height > 30
+        members, hosts = [], []
+        changed = True
+        while changed:
+            changed = False
+            for k, f in enumerate(merged):
+                if k in in_region or k in members or k in hosts:
+                    continue
+                fb = tuple(tbox[k])
+                rb = (R.x0, R.y0, R.x1, R.y1)
+                if _vov(fb, rb) >= (1.5 if chart_like else 3.0) and _hov(fb, rb) > 0:
+                    if prose_f(f) and chart_like and not (T.x0 - 3 <= f['x0'] and f['x1'] <= T.x1 + 3):
+                        lh = max(fb[3] - fb[1], 1.0)
+                        if _vov(fb, rb) < 0.6 * lh:
+                            continue                         # parágrafo largo só encostado no gráfico: não é do gráfico
+                    if not chart_like and prose_f(f):
+                        hosts.append(k)                      # parágrafo que contém a fração/raiz
+                    else:
+                        members.append(k); R |= pymupdf.Rect(fb); T |= tight_box(f); changed = True
+                elif is_alt_letter(f) and _vov(fb, (T.x0, T.y0, T.x1, T.y1)) >= 3.5 and 0 <= T.x0 - f['x1'] < 45:
+                    members.append(k); R |= pymupdf.Rect(fb); T |= tight_box(f); changed = True   # letra da alternativa
+                elif chart_like and not f['rot'] and (base_size(f) < TS(9.4) or (K < 0.95 and _dist(fb, rb) <= 6 and not prose_f(f))) and not _is_cap_like(f) and _dist(fb, rb) <= 10 \
+                        and len(''.join(p.get('t', '') for p in f['parts']).strip()) < 40:
+                    members.append(k); R |= pymupdf.Rect(fb); T |= tight_box(f); changed = True      # rótulos de eixo / legenda
+        R = T
+        in_region.update(members)
+        in_region.update(hosts)
+        if hosts:
+            hk = max(hosts, key=lambda k: _vov(tuple(tbox[k]), (T.x0, T.y0, T.x1, T.y1)))
+            rem = pymupdf.Rect(T)
+            if thin:
+                rem |= seed_rem
+            rem = pymupdf.Rect(rem.x0 - 0.6, rem.y0, rem.x1 + 0.6, rem.y1)
+            R = pymupdf.Rect(T)
+            # caracteres de TODAS as linhas do parágrafo que ficam dentro da fração/raiz entram na imagem (2D)
+            for hk2 in hosts:
+                host2 = merged[hk2]
+                keep_parts = []
+                for p in host2['parts']:
+                    if 't' not in p or not p['t'].strip() or 'oy' not in p:
+                        keep_parts.append(p); continue
+                    chs = p.get('ch') or [(p['t'], p['x'], p.get('x1', p['x'] + 4))]
+                    tb = tight_box(dict(parts=[p], x0=p['x'], x1=p.get('x1', p['x'] + 4), y0=host2['y0'], y1=host2['y1']))
+                    cy = (tb.y0 + tb.y1) / 2
+                    inside = [rem.x0 <= (c0 + c1) / 2 <= rem.x1 and rem.y0 <= cy <= rem.y1 for _, c0, c1 in chs]
+                    if not any(inside):
+                        keep_parts.append(p); continue
+                    run, run_in = [], None
+                    def flush_run():
+                        if run and not run_in:
+                            q = dict(p); q['t'] = ''.join(c for c, _, _ in run); q['x'] = run[0][1]; q['x1'] = run[-1][2]
+                            q['ch'] = list(run); keep_parts.append(q)
+                    for (c, c0, c1), ins in zip(chs, inside):
+                        if ins:
+                            R |= pymupdf.Rect(c0, tb.y0, c1, tb.y1)
+                        if run_in is None or ins != run_in:
+                            flush_run(); run = []; run_in = ins
+                        run.append((c, c0, c1))
+                    flush_run()
+                host2['parts'] = keep_parts
+            host = merged[hk]
+            R = pymupdf.Rect(R.x0 - 0.5, R.y0 - 0.4, R.x1 + 0.5, R.y1 + 0.4)
+            host['parts'].append(dict(x=R.x0, x1=R.x1, img=R, math=True))
+            EXCL.append((pno, pymupdf.Rect(R)))
+            for k in members:
+                consumed.add(k)
+            for k in hosts:
+                if k != hk:
+                    pass
+        else:
+            lns = [get_ln(k) for k in members]
+            rect = pymupdf.Rect(R)
+            rect = pymupdf.Rect(max(rect.x0 - 0.7, 0), max(rect.y0 - 0.5, BODY_TOP), rect.x1 + 0.7, min(rect.y1 + 0.5, BODY_BOT))
+            grp = 0 if gutter is None else (1 if (rect.x0 + rect.x1) / 2 < gutter else 2)
+            if gutter is not None and rect.x0 < gutter - 3 and rect.x1 > gutter + 3:
+                grp = 0
+            alt = next((ln for ln in lns if ln.parts and ln.parts[0].get('circ')), None)
+            letter = alt.parts[0]['t'].strip()[:1] if alt else None
+            for k in members:
+                consumed.add(k)
+            claimed.append(pymupdf.Rect(rect))
+            KEEP[(pno, tuple(round(v, 1) for v in rect))] = [pymupdf.Rect(tbox[k]) for k in members]
+            block_figs.append(dict(fig=True, vector=True, page=pno, rect=rect, grp=grp, y0=rect.y0, x0=rect.x0,
+                                   x1=rect.x1, y1=rect.y1, alt=letter,
+                                   tipo=('alternativa' if letter else 'tabela/gráfico/fórmula')))
+
+    out = [get_ln(k) for k in range(len(merged)) if k not in consumed]
+    # figuras raster
+    for r in big:
+        grp = 0 if gutter is None else (1 if (r.x0 + r.x1) / 2 < gutter else 2)
+        out.append(dict(fig=True, page=pno, rect=r, grp=grp, y0=r.y0, x0=r.x0, x1=r.x1, y1=r.y1))
+    out.extend(block_figs)
+
+    def key(e):
+        g = e.grp if isinstance(e, Ln) else e['grp']
+        y = e.y0 if isinstance(e, Ln) else e['y0']
+        return (g, y)
+    out.sort(key=key)
+    return out
+
+
+def tight_box(f):
+    """Caixa justa dos glifos (a caixa de linha do PyMuPDF invade 1-2 pt das linhas vizinhas)."""
+    ys0, ys1 = [], []
+    for p in f['parts']:
+        if 't' in p and p.get('t', '').strip() and 'oy' in p:
+            ys0.append(p['oy'] - 0.80 * p['size']); ys1.append(p['oy'] + 0.26 * p['size'])
+    if not ys0:
+        return pymupdf.Rect(f['x0'], f['y0'], f['x1'], f['y1'])
+    return pymupdf.Rect(f['x0'], max(min(ys0), f['y0']), f['x1'], min(max(ys1), f['y1']))
+
+
+def _is_cap_like(f):
+    return all(p['size'] <= TS(9.3) and not p['b'] for p in f['parts'] if p.get('t', '').strip()) and \
+        len(''.join(p.get('t', '') for p in f['parts']).strip()) > 25
+
+
+def _dist(a, b):
+    dx = max(a[0] - b[2], b[0] - a[2], 0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _make_ln(f, pno, gutter, boxes, small):
+    x0, y0, x1, y1, parts = f['x0'], f['y0'], f['x1'], f['y1'], f['parts']
+    parts = list(parts)
+    for r in small:                               # emojis em linha
+        cy = (r.y0 + r.y1) / 2
+        if y0 - 3 <= cy <= y1 + 3 and x0 - 2 <= r.x0 <= x1 + 2:
+            parts.append(dict(x=r.x0, img=r))
+    parts.sort(key=lambda p: p['x'])
+    sizes = [(len(p['t']), p['size']) for p in parts if 't' in p and p.get('t', '').strip()]
+    size = max(sizes)[1] if sizes else TS(10.0)
+    # ex.: '124I' (isótopo): o número sobrescrito tem mais caracteres que a letra, mas o corpo é o da letra
+    big = max((p['size'] for p in parts if 't' in p and re.search(r'[A-Za-zÀ-ÿ]', p.get('t', ''))), default=size)
+    if size < big * 0.8:
+        size = big
+    # linha de base = origem dos trechos de tamanho principal
+    main = [p['oy'] for p in parts if 't' in p and p.get('t', '').strip() and p['size'] >= size - 0.8]
+    base = statistics.median(main) if main else None
+    for p in parts:
+        if 't' in p and base is not None and p['size'] < size * 0.8:
+            d = p['oy'] - base
+            p['pos'] = 'sub' if d > 1.2 else ('sup' if d < -1.2 else None)
+    ln = Ln(page=pno, x0=x0, y0=y0, x1=x1, y1=y1, parts=parts, size=size, grp=f['grp'], wide=f['wide'], gutter=gutter)
+    txts = [p for p in parts if 't' in p and p.get('t', '').strip()]
+    tb = [p for p in txts if not (QCODE and p['size'] <= TS(8.5))] or txts
+    ln.allbold = bool(tb) and all(p['b'] for p in tb)
+    ln.boxed = any(bx.x0 - 2 <= x0 and x1 <= bx.x1 + 2 and bx.y0 - 2 <= y0 and y1 <= bx.y1 + 2 for bx in boxes)
+    ln.taint = False
+    ln.extra = []
+    return ln
+
+
+def classify(ln, left, right):
+    """Define o tipo da linha."""
+    t = ln.text().strip()
+    p0 = ln.parts[0]
+    if ln.allbold and re.match(r'^QUEST[ãÃ]O\s+\d+', t, re.I):
+        return 'qhead'
+    if ln.allbold and re.match(r'^(PROPOSTA DE REDAÇÃO|INSTRUÇÕES PARA A REDAÇÃO)\s*$', t, re.I):
+        return 'sec'
+    if ln.allbold and TS(10.5) <= ln.size <= TS(11.5):
+        return 'sec'
+    if p0.get('circ') and re.match(r'^[A-E]\.?$', p0.get('t', '').strip()):
+        return 'alt'
+    if QCODE and re.match(r'^[A-Z0-9]{4}$', t) and ln.size <= TS(8.5):
+        return 'code'
+    if ln.size <= TS(9.3) and not ln.allbold:
+        return 'cap'
+    if ln.allbold and re.match(r'^TEXTO\s+[IVX]+\s*$', t, re.I):
+        return 'label'
+    if ln.allbold and ln.size >= TS(9.5):
+        mid = (ln.x0 + ln.x1) / 2
+        if abs(mid - (left + right) / 2) < 7:
+            return 'title'
+    return 'prose'
+
+
+def fix_caps(s):
+    """O PDF mapeia 'Ã' maiúsculo como 'ã' nos títulos em caixa alta."""
+    letters = [c for c in s if c.isalpha()]
+    if letters and all(c.isupper() or c == 'ã' for c in letters):
+        return s.replace('ã', 'Ã')
+    if re.match(r'^\s*Quest[õo]es\s+de\s+\d+', s):
+        return s
+    if letters and sum(c.isupper() for c in letters) / len(letters) >= 0.4:
+        return s.upper()
+    return s
+
+
+def runs_of(ln, drop_first_letter=False):
+    """Converte as partes de uma linha em runs [(texto,b,i,size)] ou imagem."""
+    runs = []
+    first = True
+    for p in ln.parts:
+        if 'img' in p:
+            runs.append(dict(img=p['img'], math=p.get('math', False)))
+            continue
+        t = p['t']
+        if drop_first_letter and first:
+            t = re.sub(r'^[A-E]\.?', '', t.strip(), count=1) if t.strip() else ''
+            first = False
+        runs.append(dict(t=t, b=p['b'], i=p['i'], size=p['size'], pos=p.get('pos')))
+    return runs
+
+
+def build_items(doc, pages):
+    """Percorre as páginas e devolve a lista linear de itens."""
+    elements = []     # (Ln|fig, left, right)
+    for pno in pages:
+        els = load_page(doc, pno)
+        # limites de cada grupo (coluna)
+        grp_lines = {}
+        for e in els:
+            if isinstance(e, Ln) and e.size > TS(9.3) and not e.boxed:
+                grp_lines.setdefault(e.grp, []).append(e)
+        lr = {}
+        for g in (0, 1, 2):
+            ls = [e for e in els if isinstance(e, Ln) and e.grp == g and e.size > TS(9.3)]
+            if not ls:
+                ls = [e for e in els if isinstance(e, Ln) and e.grp == g]
+            if ls:
+                left = min(e.x0 for e in ls if not e.boxed) if any(not e.boxed for e in ls) else min(e.x0 for e in ls)
+                right = max(e.x1 for e in ls)
+                lr[g] = (left, right)
+        # grupo 0 em página de duas colunas = linhas largas: usa extensão da página
+        for e in els:
+            g = e.grp if isinstance(e, Ln) else e['grp']
+            left, right = lr.get(g, (31, 548))
+            elements.append((e, left, right))
+
+    items = []
+    buf = None   # dict(kind, lines)
+
+    def flush():
+        nonlocal buf
+        if not buf:
+            return
+        k, ls = buf['kind'], buf['lines']
+        if k == 'prose':
+            items.extend(prose_items(ls))
+        elif k == 'cap':
+            items.extend(caption_items(ls))
+        elif k == 'title':
+            items.append(dict(k='title', lines=[runs_of(l) for l, _, _ in ls], src=ls[0][0].page))
+        elif k == 'label':
+            items.append(dict(k='label', text=ls[0][0].text().strip().upper(), src=ls[0][0].page))
+        elif k == 'sec':
+            items.append(dict(k='sec', lines=[fix_caps(l.text().strip()) for l, _, _ in ls],
+                              boxed=ls[0][0].boxed, wide=ls[0][0].wide, src=ls[0][0].page,
+                              center=abs((ls[0][0].x0 + ls[0][0].x1) / 2 - (ls[0][1] + ls[0][2]) / 2) < 8))
+        elif k == 'alt':
+            l0 = ls[0][0]
+            letter = l0.parts[0]['t'].strip()[0]
+            runs = runs_of(l0, drop_first_letter=True)
+            for l, _, _ in ls[1:]:
+                runs.append(dict(t=' ', b=False, i=False, size=10))
+                runs.extend(runs_of(l))
+            items.append(dict(k='alt', letter=letter, runs=runs, src=l0.page))
+        buf = None
+
+    for e, left, right in elements:
+        if not isinstance(e, Ln):
+            flush()
+            if e.get('vector'):
+                items.append(dict(k=('altfig' if e.get('alt') else 'fig'), page=e['page'], rect=e['rect'], src=e['page'],
+                                  vector=True, letter=e.get('alt'), tipo=e.get('tipo'), colleft=left))
+            else:
+                items.append(dict(k='fig', page=e['page'], rect=e['rect'], src=e['page']))
+            continue
+        kind = classify(e, left, right)
+        # continuação de alternativa (recuo pendurado)
+        if buf and buf['kind'] == 'alt' and kind in ('prose', 'cap') and e.x0 - left > 8 and kind == 'prose':
+            buf['lines'].append((e, left, right))
+            continue
+        if kind == 'qhead':
+            flush()
+            m = re.search(r'(\d+)', e.text())
+            mc = re.search(r'QUEST[ãÃ]O\s+\d+\s*([A-Z0-9]{4})\s*$', e.text().strip(), re.I)
+            items.append(dict(k='qhead', num=m.group(1), src=e.page, code=(mc.group(1) if mc else None)))
+            continue
+        if kind == 'code':
+            flush()
+            items.append(dict(k='code', text=e.text().strip(), src=e.page))
+            continue
+        if kind == 'alt':
+            flush()
+            buf = dict(kind='alt', lines=[(e, left, right)])
+            continue
+        if buf and buf['kind'] == kind and kind in ('prose', 'cap', 'title', 'sec'):
+            if kind == 'sec' and buf['lines'][-1][0].boxed != e.boxed:
+                flush(); buf = dict(kind=kind, lines=[(e, left, right)])
+            else:
+                buf['lines'].append((e, left, right))
+            continue
+        flush()
+        buf = dict(kind=kind, lines=[(e, left, right)])
+    flush()
+    return _alternativas_em_linha(_formulas_no_texto(_juntar_figuras(items, doc), doc), doc)
+
+
+def _formulas_no_texto(items, doc):
+    """Bloco de fórmula que começa na margem da coluna é TEXTO corrido com fração (ex.: 'O = 16 g/mol.'),
+    não uma equação destacada. Em vez de virar figura solta, cada linha dele vira imagem dentro do parágrafo:
+    a 1ª linha continua o parágrafo anterior quando ele não terminou (; , :)."""
+    out = []
+    for it in items:
+        mem = KEEP.get((it.get('page'), tuple(round(v, 1) for v in it['rect']))) if it.get('k') == 'fig' else None
+        if not (it.get('k') == 'fig' and it.get('vector') and it.get('tipo') == 'tabela/gráfico/fórmula' and mem
+                and it.get('colleft') is not None and abs(it['rect'].x0 - it['colleft']) < 4 and it['rect'].height <= 60):
+            out.append(it)
+            continue
+        R, cl = it['rect'], it['colleft']
+        # linhas que começam na margem (ou no recuo de parágrafo) abrem uma nova linha de texto;
+        # as demais (numerador/denominador da fração) pertencem à linha com que mais se sobrepõem
+        lin = sorted(mem, key=lambda r: (r.y0, r.x0))
+        grupos = []
+        for r in lin:
+            if r.x0 - cl < 25 or not grupos:
+                grupos.append([r])
+            else:
+                best = max(grupos, key=lambda g: min(r.y1, max(b.y1 for b in g)) - max(r.y0, min(b.y0 for b in g)))
+                best.append(r)
+        if len(grupos) > 4:
+            out.append(it)
+            continue
+        # caracteres do bloco, com a linha a que pertencem (para apagar o que "vaza" de uma linha na imagem da outra)
+        chars = []
+        for b in doc[it['page']].get_text('rawdict', clip=R)['blocks']:
+            if b['type'] != 0:
+                continue
+            for l in b['lines']:
+                for sp in l['spans']:
+                    for ch in sp['chars']:
+                        bb = pymupdf.Rect(ch['bbox'])
+                        c = pymupdf.Point((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2)
+                        gi = next((k for k, g in enumerate(grupos) if any(m.contains(c) for m in g)), None)
+                        base = ch['origin'][1]
+                        chars.append((gi, pymupdf.Rect(bb.x0, bb.y0, bb.x1, min(bb.y1, base + 0.8))))
+        tiras = []
+        for gi, g in enumerate(grupos):
+            u = pymupdf.Rect(g[0])
+            for m in g[1:]:
+                u |= m
+            tira = pymupdf.Rect(u.x0 - 0.7, max(u.y0 - 0.5, R.y0), u.x1 + 0.7, min(u.y1 + 0.5, R.y1))
+            mask = [bb for (k, bb) in chars if k is not None and k != gi and bb.intersects(tira)]
+            tiras.append((tira, mask))
+        for n, (tira, mask) in enumerate(tiras):
+            EXCL.append((it['page'], pymupdf.Rect(tira)))
+            img = dict(x=tira.x0, x1=tira.x1, img=tira, math=True, mask=mask)
+            prev = out[-1] if out else None
+            txt_prev = ''.join(r.get('t', '') for r in prev.get('runs', [])).rstrip() if prev and prev.get('k') == 'para' else ''
+            if n == 0 and prev is not None and prev.get('k') == 'para' and prev.get('src') == it['src'] \
+                    and not txt_prev.endswith(('.', '?', '!')) \
+                    and (txt_prev.endswith((';', ',', ':')) or (prev['runs'] and 'img' in prev['runs'][-1])):
+                prev['runs'].append(dict(t=' ', b=False, i=False, size=10))
+                prev['runs'].append(img)
+                prev['nlines'] = prev.get('nlines', 1) + 1
+                continue
+            ind = tira.x0 - cl if tira.x0 - cl > 8 else 0.0
+            out.append(dict(k='para', runs=[img], indent=ind, left=0.0, justify=False, src=it['src'], nlines=1, center=False))
+    return out
+
+
+def _juntar_figuras(items, doc):
+    """Uma figura só que o arquivo guarda em pedaços (imagem fatiada em 2 ou 3 blocos encostados) ou
+    duas figuras lado a lado com legenda embaixo (ex.: 'Solo bem estruturado' | 'Solo compactado')
+    viram UMA figura — senão saem empilhadas, separadas da legenda ou em páginas diferentes."""
+    def encostadas(a, b):
+        tol = 3.0
+        sy = min(a.y1, b.y1) - max(a.y0, b.y0)
+        sx = min(a.x1, b.x1) - max(a.x0, b.x0)
+        if a.intersects(b) and sx > 0 and sy > 0:
+            return True
+        lado = (abs(a.x1 - b.x0) <= tol or abs(b.x1 - a.x0) <= tol) and sy >= 0.5 * min(a.height, b.height)
+        cima = (abs(a.y1 - b.y0) <= tol or abs(b.y1 - a.y0) <= tol) and sx >= 0.5 * min(a.width, b.width)
+        return lado or cima
+
+    def pareadas(a, b):
+        gap = max(b.x0 - a.x1, a.x0 - b.x1)
+        return (0 <= gap <= 15 and abs(a.y0 - b.y0) <= 6 and
+                abs(a.height - b.height) <= 0.25 * max(a.height, b.height))
+
+    out = []
+    for it in items:
+        prev = out[-1] if out else None
+        if (it.get('k') == 'fig' and prev is not None and prev.get('k') == 'fig' and prev.get('page') == it.get('page')
+                and (encostadas(prev['rect'], it['rect']) or pareadas(prev['rect'], it['rect']))):
+            par = pareadas(prev['rect'], it['rect'])
+            prev['rect'] = pymupdf.Rect(prev['rect']) | it['rect']
+            prev['vector'] = bool(prev.get('vector') or it.get('vector'))
+            prev['_par'] = prev.get('_par') or par
+            continue
+        out.append(it)
+    # legendas curtas logo abaixo de figuras pareadas entram no recorte
+    res = []
+    for it in out:
+        prev = res[-1] if res else None
+        if it.get('k') == 'para' and prev is not None and prev.get('k') == 'fig' and prev.get('_par') \
+                and it.get('nlines', 1) == 1 and it.get('src') == prev.get('page'):
+            txt = ''.join(r.get('t', '') for r in it.get('runs', [])).strip()
+            R = prev['rect']
+            yb = prev.setdefault('_y1fig', R.y1)            # base da figura (antes de somar legendas)
+            hit = None
+            if 0 < len(txt) <= 45:
+                for h in doc[prev['page']].search_for(txt):
+                    if yb - 3 <= h.y0 <= yb + 22 and h.x0 >= R.x0 - 5 and h.x1 <= R.x1 + 5:
+                        hit = h
+                        break
+            if hit is not None:
+                prev['rect'] = pymupdf.Rect(R) | pymupdf.Rect(hit.x0 - 1, hit.y0 - 1, hit.x1 + 1, hit.y1 + 1)
+                prev['vector'] = True                       # legenda é texto: o recorte precisa mantê-lo
+                continue
+        res.append(it)
+    for it in res:
+        it.pop('_par', None); it.pop('_y1fig', None)
+    return res
+
+
+def _alternativas_em_linha(items, doc):
+    """Alternativa com fórmula (fração, raiz, expoente) que o parser recortou como figura:
+    1) junta ao recorte a parte da fórmula que ficou separada (ex.: 'σ1 =' + a fração ao lado);
+    2) tira o círculo da letra do recorte e devolve como alternativa comum com a fórmula embutida —
+       assim a letra e o recuo ficam iguais aos das alternativas de texto."""
+    # 1) fórmula da alternativa separada em outro bloco ao lado
+    for i, it in enumerate(items):
+        if it.get('k') != 'altfig':
+            continue
+        R = it['rect']
+        for j in (i - 1, i + 1):
+            o = items[j] if 0 <= j < len(items) else None
+            if not (o and o.get('k') == 'fig' and o.get('vector') and o.get('page') == it['page']):
+                continue
+            Q = o['rect']
+            sob = min(R.y1, Q.y1) - max(R.y0, Q.y0)
+            if sob > 0.6 * min(R.height, Q.height) and -2 <= Q.x0 - R.x1 <= 8 and Q.height <= 3 * max(R.height, 12):
+                it['rect'] = pymupdf.Rect(R) | Q
+                o['k'] = '_drop'
+                R = it['rect']
+    items = [it for it in items if it.get('k') != '_drop']
+    # 2) círculo da letra fora do recorte; fórmula entra como imagem na alternativa
+    out = []
+    for it in items:
+        if it.get('k') != 'altfig':
+            out.append(it)
+            continue
+        R = it['rect']
+        page = doc[it['page']]
+        circ_x1, conteudo_x0 = None, None
+        for b in page.get_text('rawdict', clip=R)['blocks']:
+            if b['type'] != 0:
+                continue
+            for l in b['lines']:
+                for sp in l['spans']:
+                    eh_circ = any(cf in sp['font'].lower() for cf in CIRC_FONTS)
+                    for ch in sp['chars']:
+                        if not ch['c'].strip():
+                            continue
+                        if eh_circ:
+                            circ_x1 = max(circ_x1 or 0, ch['bbox'][2])
+                        else:
+                            conteudo_x0 = min(conteudo_x0 or 9e9, ch['bbox'][0])
+        if circ_x1 is None:
+            out.append(it)
+            continue
+        for dr in page.get_drawings():
+            rr = dr['rect']
+            if rr.x0 > circ_x1 + 0.5 and rr.intersects(R) and R.contains(rr.tl):
+                conteudo_x0 = min(conteudo_x0 or 9e9, rr.x0)
+        if conteudo_x0 is None or conteudo_x0 >= R.x1:
+            out.append(it)
+            continue
+        crop = pymupdf.Rect(max(circ_x1 + 0.3, conteudo_x0 - 0.8), R.y0, R.x1, R.y1)
+        EXCL.append((it['page'], pymupdf.Rect(crop)))
+        out.append(dict(k='alt', letter=it.get('letter'), src=it['src'],
+                        runs=[dict(t='', b=False, i=False, size=10), dict(x=crop.x0, x1=crop.x1, img=crop, math=True)]))
+    return out
+
+
+# ---------------------------------------------------------------- parágrafos / versos
+def _join_runs(lines):
+    """Junta as linhas de um parágrafo num fluxo contínuo de runs."""
+    runs = []
+    for idx, ln in enumerate(lines):
+        rs = runs_of(ln)
+        if idx > 0 and runs:
+            last = next((r for r in reversed(runs) if 't' in r), None)
+            if last is not None and last['t'].rstrip().endswith('-') and not last['t'].rstrip().endswith(' -'):
+                last['t'] = last['t'].rstrip()          # hífen no fim da linha: cola sem espaço
+            else:
+                runs.append(dict(t=' ', b=False, i=False, size=10))
+        runs.extend(rs)
+    return runs
+
+
+def prose_items(ls):
+    """Segmenta linhas de prosa em parágrafos / blocos de verso."""
+    lines = [l for l, _, _ in ls]
+    lefts = {id(l): lf for l, lf, _ in ls}
+    rights = {id(l): rt for l, _, rt in ls}
+    # passo de linha típico
+    diffs = [b.y0 - a.y0 for a, b in zip(lines, lines[1:]) if a.grp == b.grp and a.page == b.page and 0 < b.y0 - a.y0 < 20]
+    if len(diffs) >= 3:
+        pitch = statistics.median(diffs)
+    elif diffs:
+        pitch = min(diffs)          # poucas linhas: a mediana mistura entrelinha com espaço entre parágrafos
+    else:
+        pitch = 12.5
+
+    segs, cur = [], [lines[0]]
+    for a, b in zip(lines, lines[1:]):
+        left, right = lefts[id(b)], rights[id(b)]
+        same = a.grp == b.grp and a.page == b.page
+        new = False
+        if same:
+            if b.y0 - a.y0 > pitch * 1.3:
+                new = True
+            elif b.x0 > a.x0 + 8:
+                new = True
+            elif a.allbold != b.allbold:
+                new = True
+            elif b.text().lstrip().startswith(('•', '▪', '– ')):
+                new = True
+        else:
+            full_a = a.x1 >= rights[id(a)] - 6
+            if not full_a or b.x0 - left > 8:
+                new = True
+        if new:
+            segs.append(cur); cur = [b]
+        else:
+            cur.append(b)
+    segs.append(cur)
+
+    out = []
+    for seg in segs:
+        left = lefts[id(seg[0])]; right = rights[id(seg[0])]
+        n = len(seg)
+        short = [i for i in range(n - 1) if seg[i].x1 < rights[id(seg[i])] - 8]
+        if n >= 2 and len(short) >= 0.5 * (n - 1):
+            out.append(dict(k='verse', lines=[runs_of(l) for l in seg], left=min(l.x0 for l in seg) - left, src=seg[0].page))
+            continue
+        # prosa: quebra interna após linha curta seguida de linha não recuada
+        parts, cur = [], [seg[0]]
+        for i in range(1, n):
+            if (i - 1) in short:
+                parts.append(cur); cur = [seg[i]]
+            else:
+                cur.append(seg[i])
+        parts.append(cur)
+        for pt in parts:
+            first_indent = 0.0
+            rest_left = min(l.x0 for l in pt[1:]) if len(pt) > 1 else pt[0].x0
+            if len(pt) > 1 and pt[0].x0 > rest_left + 8:
+                first_indent = pt[0].x0 - rest_left
+            elif len(pt) > 1 and pt[0].text().lstrip().startswith(('•', '▪', '– ')) and pt[0].x0 < rest_left - 3:
+                first_indent = pt[0].x0 - rest_left          # recuo pendurado: marcador sai da margem do texto
+            lft = rest_left - left if len(pt) > 1 else (pt[0].x0 - left if first_indent == 0 else 0)
+            if len(pt) == 1 and pt[0].x0 - left > 8:
+                first_indent, lft = pt[0].x0 - left, 0.0
+            if lft < 8 and not (first_indent < 0):
+                lft = 0.0
+            full = sum(1 for l in pt[:-1] if l.x1 >= rights[id(l)] - 6)
+            justify = len(pt) >= 2 and full >= 0.6 * (len(pt) - 1)
+            center = (len(pt) == 1 and not pt[0].text().lstrip().startswith(('•', '▪', '– ')) and abs((pt[0].x0 + pt[0].x1) / 2 - (left + right) / 2) < 7
+                      and (pt[0].x1 - pt[0].x0) < 0.9 * (right - left) and pt[0].x0 - left > 8)
+            out.append(dict(k='para', runs=_join_runs(pt), indent=first_indent, left=lft, justify=justify, src=pt[0].page,
+                            nlines=len(pt), center=center))
+    return out
+
+
+def caption_items(ls):
+    """Legendas (fonte): agrupa por alinhamento."""
+    out, grp, align = [], [], None
+    for l, left, right in ls:
+        mid = (l.x0 + l.x1) / 2
+        if l.x1 >= right - 5:
+            al = 'right'
+        elif abs(mid - (left + right) / 2) < 6:
+            al = 'center'
+        else:
+            al = 'left'
+        if al != align and grp:
+            out.append((align, grp)); grp = []
+        align = al
+        grp.append(l)
+    if grp:
+        out.append((align, grp))
+    items = []
+    for al, g in out:
+        runs = []
+        for idx, l in enumerate(g):
+            rs = runs_of(l)
+            if idx > 0:
+                brk = l.text().strip().startswith('Acesso em') or al == 'center'
+                runs.append(dict(t='\n' if brk else ' ', b=False, i=False, size=8))
+            runs.extend(rs)
+        items.append(dict(k='cap', runs=runs, align=al, src=g[0].page))
+    return items
+
+
+
+def find_rascunho_page(doc):
+    """Índice (0-based) da página de instruções + rascunho da redação (marca d'água grande), ou None."""
+    for pno in range(1, len(doc) - 1):
+        for blk in doc[pno].get_text('dict')['blocks']:
+            if blk['type'] == 0:
+                for l in blk['lines']:
+                    for sp in l['spans']:
+                        if sp['size'] > 30 and 'RASCUNHO' in sp['text'].upper():
+                            return pno
+    return None
