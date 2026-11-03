@@ -11,7 +11,7 @@ import os, re, hashlib, tempfile, threading
 import pymupdf
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER, TA_RIGHT
-from reportlab.lib.colors import Color, white
+from reportlab.lib.colors import Color, CMYKColor, white
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.pdfmetrics import getAscentDescent
@@ -22,7 +22,7 @@ from reportlab.platypus.flowables import CondPageBreak
 import enem_parse
 from enem_parse import build_items, load_page, Ln, find_rascunho_page
 
-VERSAO = '2026-10-26 v4 (alternativas com fórmula)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
+VERSAO = '2026-11-03 v5 (perfil EM)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
 S = 1.2                                   # fator de ampliação (corpo -> 12 pt)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_DIRS = [_HERE + os.sep, '/usr/share/fonts/truetype/crosextra/', '/usr/share/fonts/truetype/liberation/']
@@ -169,6 +169,9 @@ class Tag(Flowable):
 
 
 TEAL = Color(0.0, 0.660, 0.557)
+ACCENT = TEAL      # cor do fio da questão e do código (EM: cor da série)
+BLANK = 0          # páginas em branco depois da capa (EM: 1, exceto se a folha de rascunho cair ímpar-par)
+RASC_PAGES = []    # páginas de conteúdo onde caiu a folha de rascunho
 
 
 class QHead(Flowable):
@@ -196,11 +199,11 @@ class QHead(Flowable):
             if self.code:
                 cs = 7.0 * S
                 cw = pdfmetrics.stringWidth(self.code, 'Car', cs)
-                c.setFillColor(TEAL); c.setFont('Car', cs)
+                c.setFillColor(ACCENT); c.setFont('Car', cs)
                 c.drawRightString(self.aw, base + 0.4, self.code)
                 xr = self.aw - cw - 6
             yc = base + 0.33 * self.fs
-            c.setStrokeColor(TEAL)
+            c.setStrokeColor(ACCENT)
             for dy, lw in ((-1.25, 0.43), (0.0, 0.86), (1.25, 0.43)):
                 c.setLineWidth(lw * S)
                 c.line(x0, yc + dy * S, xr, yc + dy * S)
@@ -349,7 +352,7 @@ class Fig(Flowable):
         x, y = self.canv.absolutePosition(0, 0)
         if self.is_alt and hasattr(self, 'gid'):
             GROUP_PAGES.setdefault(self.gid, {})['fim'] = self.canv.getPageNumber()
-        self.info['pagina_saida'] = self.canv.getPageNumber() + 1
+        self.info['pagina_saida'] = self.canv.getPageNumber() + 1 + BLANK
         FIGS.append((self.canv.getPageNumber(), x, y, self.w, self.h, self.src_page, self.rect, self.rot, self.vector))
 
 
@@ -368,6 +371,7 @@ class RascPage(Flowable):
     def draw(self):
         c = self.canv
         NO_RULE_PAGES.add(c.getPageNumber())
+        RASC_PAGES.append(c.getPageNumber())
         tb = self.n * self.ROW_H                       # altura da tabela
         # marca d'água (atrás das linhas)
         c.saveState()
@@ -400,7 +404,7 @@ class Rule(Flowable):
 class Doc(BaseDocTemplate):
     def handle_pageBegin(self):
         # força a margem certa pela paridade da página: página de saída par (conteúdo ímpar) = X_EVEN
-        self.pageTemplate = self.pageTemplates[0 if (self.page + 1) % 2 == 1 else 1]
+        self.pageTemplate = self.pageTemplates[0 if (self.page + 1 + BLANK) % 2 == 1 else 1]
         super().handle_pageBegin()
 
     def afterFlowable(self, fl):
@@ -700,6 +704,9 @@ def pass2(src_path, content_path, out_path, npages, rp):
     content = pymupdf.open(content_path)
     out = pymupdf.open()
     out.insert_pdf(src, from_page=0, to_page=0)   # capa intacta
+    for _b in range(BLANK):                       # verso da capa em branco (conteúdo começa na pág. 3)
+        bp = out.new_page(width=MBW, height=MBH)
+        bp.set_cropbox(pymupdf.Rect(O, O, O + W, O + H))
     last_src = len(src) - 1
     fkeys = {c: _footer_key(src, c) for c in range(1, last_src)}
     font_b = pymupdf.Font(fontfile=fpath(BOLD_FILE))
@@ -718,8 +725,9 @@ def pass2(src_path, content_path, out_path, npages, rp):
     for v in GROUP_PAGES.values():
         if v.get('ini') and v.get('fim') and v['fim'] > v['ini']:
             continua.update(range(v['ini'], v['fim']))
+    ultimo_src = None
     for i in range(npages):
-        n = i + 2
+        n = i + 2 + BLANK
         pg = out.new_page(width=MBW, height=MBH)
         pg.show_pdf_page(pymupdf.Rect(O, O, O + W, O + H), content, i)
         for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS:
@@ -737,7 +745,9 @@ def pass2(src_path, content_path, out_path, npages, rp):
             shp.draw_line((xl, yy), (xl + FRAME_W, yy)); shp.finish(color=(0.137, 0.122, 0.125), width=0.6)
             shp.draw_line((xl, yy + 2.6), (xl + FRAME_W, yy + 2.6)); shp.finish(color=(0.137, 0.122, 0.125), width=1.6)
             shp.commit()
-        first = PAGE_SRC.get(i + 1, 1)
+        # página que só continua uma questão da anterior não tem marcador próprio: usa a origem da anterior
+        first = PAGE_SRC.get(i + 1) or ultimo_src or next((c for c in range(1, last_src) if fkeys.get(c)), 1)
+        ultimo_src = first
         hs = src_for(n, first)
         pg.show_pdf_page(pymupdf.Rect(O - 10, O - 10, O + W + 10, O + HDR_H), srcm, hs,
                          clip=pymupdf.Rect(O - 10, O - 10, O + W + 10, O + HDR_H))
@@ -945,15 +955,15 @@ def conferir(src_path, out_path, items, tipo, rp):
     nfig = sum(1 for i in items if i['k'] in ('fig', 'altfig'))
     fora = []
     for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS:
-        xl = X_EVEN if (pn + 1) % 2 == 0 else X_ODD
+        xl = X_EVEN if (pn + 1 + BLANK) % 2 == 0 else X_ODD
         if x < xl - 0.6 or x + w > xl + FRAME_W + 0.6 or y < H - FRAME_BOT - 0.6 or y + h > H - FRAME_TOP + 0.6:
-            fora.append(pn + 1)
+            fora.append(pn + 1 + BLANK)
     add('Figuras: todas colocadas, nenhuma excede a página', len(FIGS) == nfig and not fora,
         f'{len(FIGS)} de {nfig} figuras' + (f'; fora da área nas páginas {fora}' if fora else ''))
 
     # 5) numeração de páginas sequencial no rodapé
     errs = []
-    for p in range(1, len(out) - 1):
+    for p in range(1 + BLANK, len(out) - 1):
         nums = []
         if NUMSTYLE == '2026':
             for blk in _gt(out[p], 'rawdict', pymupdf.Rect(0, FTR_Y + 2, W + 10, 765))['blocks']:
@@ -977,14 +987,14 @@ def conferir(src_path, out_path, items, tipo, rp):
         'ok' if not errs else f'numeração divergente nas páginas {errs}')
 
     # 5b) margens alternando conforme página par/ímpar (como no original)
-    mg = [pn for pn, x in sorted(FRAME_X.items()) if abs(x - (X_EVEN if pn % 2 == 1 else X_ODD)) > 0.5]
+    mg = [pn for pn, x in sorted(FRAME_X.items()) if abs(x - (X_EVEN if (pn + BLANK) % 2 == 1 else X_ODD)) > 0.5]
     add('Margens: alternância par/ímpar igual à do original', not mg,
-        'ok' if not mg else f'margem trocada nas páginas {[m + 1 for m in mg][:15]}')
+        'ok' if not mg else f'margem trocada nas páginas {[m + 1 + BLANK for m in mg][:15]}')
 
     # 6) nenhuma página em branco, nenhum texto fora da folha
     brancas, fora_tx = [], []
-    figpag = {pn for (pn, *_r) in FIGS}
-    for p in range(1, len(out) - 1):
+    figpag = {pn + BLANK for (pn, *_r) in FIGS}
+    for p in range(1 + BLANK, len(out) - 1):
         d = _gt(out[p], 'rawdict', _bclip())
         txt = ''.join(c['c'] for b in d['blocks'] if b['type'] == 0 for l in b['lines'] for sp in l['spans'] for c in sp['chars']).strip()
         if not txt and p not in figpag and not _eh_rascunho(out[p]):
@@ -1006,16 +1016,16 @@ def conferir(src_path, out_path, items, tipo, rp):
         if permitido:
             continue
         if fim - ini >= 2:
-            q3.append(f'{nome} (págs. {ini + 1}–{fim + 1})')
+            q3.append(f'{nome} (págs. {ini + 1 + BLANK}–{fim + 1 + BLANK})')
         elif alt <= FRAME_H - 2:
-            qdesnec.append(f'{nome} (pág. {ini + 1})')
+            qdesnec.append(f'{nome} (pág. {ini + 1 + BLANK})')
     add('Quebras: nenhuma questão em 3+ páginas nem dividida sem necessidade', not q3 and not qdesnec,
         'ok' if not (q3 or qdesnec) else '; '.join(x for x in (
             ('em 3+ páginas: ' + ', '.join(q3)) if q3 else '',
             ('caberia numa página só: ' + ', '.join(qdesnec)) if qdesnec else '') if x))
 
     # 6c) nenhum "resto de diagramação" recortado como figura (abas laterais, filetes soltos)
-    finas = [f'pág. {pn + 1}' for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS if vec and ((rect.width < 10 and rect.height > 10) or rect.height < 4)]
+    finas = [f'pág. {pn + 1 + BLANK}' for (pn, x, y, w, h, sp, rect, rot, vec) in FIGS if vec and ((rect.width < 10 and rect.height > 10) or rect.height < 4)]
     add('Figuras: nenhuma aba, filete ou barra de fração solta recortada como figura', not finas,
         'ok' if not finas else 'conferir: ' + ', '.join(finas))
 
@@ -1050,14 +1060,37 @@ PERFIS = {
                      lead=16.0, qh=9.0, sec=10.0, cap=7.0, qstyle='teal', sstyle='plain', hdr_h=39.3, ftr_y=733.2,
                      numstyle='2026', rasc_y0=175.0, instr_y1=176.5, alt_ind=17.0, frame_w=484.8, frame_top=41.5,
                      frame_bot=731.5, x_even=34.0, x_odd=48.2, body_top=36.5, body_bot=733.0, qcode=True),
+    # Simulado Ensino Médio: mesmo miolo do SE2026, com cor da série e verso da capa em branco
+    'em': dict(rotulo='EM – Simulado Ensino Médio (Arial 9 pt → 12 pt)', body=9.0, fonte='liberation', circ=('teste',),
+               lead=16.0, qh=9.0, sec=10.0, cap=7.0, qstyle='teal', sstyle='plain', hdr_h=39.3, ftr_y=733.2,
+               numstyle='2026', rasc_y0=175.0, instr_y1=176.5, alt_ind=17.0, frame_w=484.8, frame_top=41.5,
+               frame_bot=731.5, x_even=34.0, x_odd=48.2, body_top=35.8, body_bot=733.0, qcode=True, blank=1),
 }
+
+# cor do fio de parágrafo por série do EM (CMYK informado pela editora de arte)
+CORES_SERIE = {1: CMYKColor(0.74, 1.00, 0.00, 0.00),     # EM1 roxo  C74 M100 Y0 K0
+               2: CMYKColor(0.88, 0.08, 0.29, 0.00),     # EM2 azul  C88 M8 Y29 K0
+               3: CMYKColor(0.90, 0.04, 0.58, 0.00)}     # EM3 verde C90 M4 Y58 K0
+SERIE = None
+
+
+def detectar_serie(pdf_bytes):
+    """Série do EM pela capa ('Simulado Ensino Médio – 1ª série') ou pelo rodapé ('EM 1ª SÉRIE')."""
+    doc = pymupdf.open(stream=pdf_bytes, filetype='pdf')
+    for pno in [0] + list(range(1, min(len(doc), 6))):
+        m = re.search(r'(?:ENSINO\s+M[ÉE]DIO\s*[–-]\s*|EM\s+)([123])\s*[ªaº]?\s*S[ÉE]RIE', doc[pno].get_text().upper())
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def aplicar_perfil(chave):
     """Troca as constantes de layout do motor e do parser para o perfil escolhido."""
     global S, LEAD, QH_SRC, SEC_SRC, CAP_SRC, QSTYLE, SSTYLE, HDR_H, FTR_Y, NUMSTYLE, RASC_Y0, INSTR_Y1, ALT_IND
-    global FRAME_W, FRAME_TOP, FRAME_BOT, FRAME_H, X_EVEN, X_ODD, PERFIL
+    global FRAME_W, FRAME_TOP, FRAME_BOT, FRAME_H, X_EVEN, X_ODD, PERFIL, ACCENT, BLANK
     p = PERFIS[chave]
+    BLANK = p.get('blank', 0)
+    ACCENT = CORES_SERIE.get(SERIE, CORES_SERIE[1]) if chave == 'em' else TEAL
     S = 12.0 / p['body']
     LEAD, QH_SRC, SEC_SRC, CAP_SRC = p['lead'], p['qh'], p['sec'], p['cap']
     QSTYLE, SSTYLE, HDR_H, FTR_Y, NUMSTYLE = p['qstyle'], p['sstyle'], p['hdr_h'], p['ftr_y'], p['numstyle']
@@ -1091,6 +1124,11 @@ def detectar_perfil(pdf_bytes):
         return None
     (fam, size), _n = cnt.most_common(1)[0]
     if fam == 'arial' and size == 9:
+        capa = doc[0].get_text().upper()
+        rod = ' '.join(doc[p].get_text('text', clip=pymupdf.Rect(0, 733, doc[p].rect.width, 779)).upper()
+                       for p in range(1, min(len(doc) - 1, 6)))
+        if re.search(r'SIMULADO\s+ENSINO\s+M[ÉE]DIO', capa) or re.search(r'EM\s+[123]\s*[ªA]\s*S[ÉE]RIE', rod):
+            return 'em'
         return 'enem2026'
     if fam == 'calibri' and size == 10:
         return 'ppl'
@@ -1167,10 +1205,17 @@ def normalizar_pdf(pdf_bytes):
     return out.tobytes(garbage=3, deflate=True), info
 
 
+def _reset_layout():
+    """Limpa só o que a passada 1 (montagem das páginas) preenche, para remontar com outra paridade."""
+    FIGS.clear(); PAGE_SRC.clear(); FRAME_Y.clear(); FRAME_X.clear(); GROUP_PAGES.clear(); GROUP_H.clear()
+    NO_RULE_PAGES.clear(); WARN.clear(); RASC_PAGES.clear(); GROUP_LABEL.clear(); FIG_NOTES.clear(); BLOCOS.clear()
+
+
 def _reset():
     global TMP
     TMP = tempfile.mkdtemp(prefix='ampl_')
     FIGS.clear(); PAGE_SRC.clear(); FRAME_Y.clear(); FRAME_X.clear(); GROUP_PAGES.clear(); GROUP_H.clear(); NO_RULE_PAGES.clear(); WARN.clear()
+    RASC_PAGES.clear()
     GROUP_LABEL.clear(); FIG_NOTES.clear(); BLOCOS.clear(); enem_parse.EXCL.clear()
 
 
@@ -1214,6 +1259,8 @@ def _preparar_entrada(pdf_bytes, perfil):
     chave = perfil or det
     if chave is None:
         raise ValueError('Não reconheci o modelo desta prova (fonte/tamanho do texto). Escolha o perfil manualmente.')
+    global SERIE
+    SERIE = detectar_serie(pdf_bytes) if chave == 'em' else None
     aplicar_perfil(chave)
     novo, caixas = normalizar_pdf(pdf_bytes)
     return novo, chave, det, caixas
@@ -1263,6 +1310,14 @@ def ampliar(pdf_bytes, progress=None, perfil=None):
         content = os.path.join(wd, 'conteudo.pdf')
         if progress: progress(0.35, 'Remontando as páginas em coluna única, 12 pt...')
         npages = pass1(src, items, content, rp)
+        global BLANK
+        if PERFIS[chave].get('blank') and tipo['prova'] == 'I' and RASC_PAGES:
+            # folha de rascunho precisa abrir par-ímpar (as duas páginas lado a lado).
+            # Se com o verso em branco ela cair ímpar-par, tira o verso: o conteúdo começa na pág. 2.
+            if (RASC_PAGES[0] + 1 + BLANK) % 2 == 1:
+                BLANK = 0
+                _reset_layout()
+                npages = pass1(src, items, content, rp)
         if progress: progress(0.7, 'Aplicando figuras, cabeçalho e rodapé originais...')
         out_path = os.path.join(wd, 'ampliado.pdf')
         total = pass2(path, content, out_path, npages, rp)
@@ -1280,4 +1335,4 @@ def ampliar(pdf_bytes, progress=None, perfil=None):
                     blocos_imagem=[dict(b) for b in BLOCOS], inline_imagens=sorted({p + 1 for p, _r in enem_parse.EXCL}),
                     questoes_divididas=quebradas, auditoria=aud, checagens=checagens,
                     conferencia_ok=all(c['ok'] for c in checagens),
-                    prova=tipo['prova'], avisos=avisos)
+                    prova=tipo['prova'], avisos=avisos, serie=SERIE, paginas_em_branco_apos_capa=BLANK)
