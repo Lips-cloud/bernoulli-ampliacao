@@ -14,7 +14,7 @@ OPCOES = [AUTO] + [PERFIS_MOTOR[k]["rotulo"] for k in PERFIS_MOTOR] + [
     "Bahiana (em breve)", "SBAHIA 2E (em breve)", "Módulo (em breve)", "A4 Bernoulli (em breve)", "Itinerários (em breve)"]
 escolha = st.selectbox("Perfil da prova", OPCOES)
 if escolha.endswith("(em breve)"):
-    st.info("Este perfil ainda não foi implementado. Por enquanto: ENEM 2026 e ENEM PPL 2025.")
+    st.info("Este perfil ainda não foi implementado. Por enquanto: ENEM 2026, ENEM PPL 2025 e EM – Simulado Ensino Médio.")
     st.stop()
 perfil_escolhido = None if escolha == AUTO else next(k for k, v in PERFIS_MOTOR.items() if v["rotulo"] == escolha)
 
@@ -129,6 +129,11 @@ if r:
     c1, c2 = st.columns(2)
     c1.metric("Páginas (original)", r["paginas_entrada"])
     c2.metric("Páginas (ampliado)", r["paginas_saida"])
+    if r.get("perfil") == "em":
+        serie = f"{r['serie']}ª série" if r.get("serie") else "série não identificada (usando a cor da 1ª série)"
+        verso = ("conteúdo começa na pág. 3 (verso da capa em branco)" if r.get("paginas_em_branco_apos_capa")
+                 else "conteúdo começa na pág. 2 (sem verso em branco, para a folha de rascunho abrir par-ímpar)")
+        st.info(f"EM – {serie}; {verso}.")
     for av in r["avisos"]:
         st.warning(av)
     if r["conferencia_ok"]:
