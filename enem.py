@@ -15,6 +15,7 @@ from reportlab.lib.colors import Color, CMYKColor, white
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.pdfmetrics import getAscentDescent
+from reportlab.platypus import Table, TableStyle
 from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph, KeepTogether,
                                 Flowable, PageBreak)
 from reportlab.platypus.flowables import CondPageBreak
@@ -22,7 +23,7 @@ from reportlab.platypus.flowables import CondPageBreak
 import enem_parse
 from enem_parse import build_items, load_page, Ln, find_rascunho_page
 
-VERSAO = '2026-11-03 v5 (perfil EM)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
+VERSAO = '2026-11-10 v6 (EM Prova II: figuras, rótulos, frações)'   # aparece no app e nos metadados do PDF: confirma o que está em produção
 S = 1.2                                   # fator de ampliação (corpo -> 12 pt)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_DIRS = [_HERE + os.sep, '/usr/share/fonts/truetype/crosextra/', '/usr/share/fonts/truetype/liberation/']
@@ -121,13 +122,39 @@ def emoji_png(rect, pno, src_doc, dpi=300, mask=()):
     return path
 
 
+def _com_margem(path, w_pt, pad_pt):
+    """Cópia da imagem com uma faixa branca à esquerda (o espaço entre a palavra e a fórmula)."""
+    from PIL import Image as _Im
+    novo = path[:-4] + f'_m{int(pad_pt * 10)}.png'
+    if not os.path.exists(novo):
+        im = _Im.open(path).convert('RGB')
+        px = max(1, int(round(im.width * pad_pt / max(w_pt, 1))))
+        out = _Im.new('RGB', (im.width + px, im.height), 'white')
+        out.paste(im, (px, 0))
+        out.save(novo)
+    return novo
+
+
 def markup(runs, src_doc, pno, text_scale=1.0):
     out = []
     for r in runs:
         if 'img' in r:
             rect = r['img']
             p = emoji_png(rect, pno, src_doc, 500 if r.get('math') else 300, r.get('mask', ()))
-            out.append(f'<img src="{p}" width="{rect.width*S:.1f}" height="{rect.height*S:.1f}" valign="middle"/>')
+            # \u200b (espaço de largura zero) antes da imagem: sem ele, imagem alta no começo de uma linha quebrada
+            # não aumenta a entrelinha no ReportLab e invade a linha de cima/baixo
+            # imagem colada na palavra anterior (espaço não separável): imagem alta sozinha no começo de uma linha
+            # quebrada não aumenta a entrelinha no ReportLab e invade as linhas de cima e de baixo
+            # (o ReportLab quebra até em espaço não separável; então tira o espaço e põe a folga dentro da imagem)
+            w = rect.width * S
+            tirou = False
+            while out and not re.sub(r'<[^>]+>', '', out[-1]).strip() and '<img' not in out[-1] and '<br' not in out[-1]:
+                out.pop(); tirou = True                     # pedaços que são só espaço
+            if out and re.search(r'\s((?:</[a-z]+>)*)$', out[-1]):
+                out[-1] = re.sub(r'\s+((?:</[a-z]+>)*)$', '\\1', out[-1]); tirou = True
+            if tirou:
+                p, w = _com_margem(p, rect.width * S, 3.0 * text_scale), rect.width * S + 3.0 * text_scale
+            out.append(f'<img src="{p}" width="{w:.1f}" height="{rect.height*S:.1f}" valign="middle"/>')
             continue
         t = esc(r['t'].strip() if r.get('pos') else r['t']).replace('\n', '<br/>')
         if not t:
@@ -153,7 +180,7 @@ GROUP_H = {}      # id do grupo -> (altura total em pt, quebra permitida?)
 NO_RULE_PAGES = set()
 FIG_NOTES = []   # figuras giradas / sozinhas em página (revisão manual)
 BLOCOS = []      # blocos vetoriais convertidos em imagem (tabelas, gráficos, fórmulas, alternativas)
-ESC_MIN = 1.0    # figura nunca fica menor que no original; abaixo disso vai para girada/sozinha (revisão manual)
+ESC_MIN = 0.95   # figura nunca fica menor que no original; abaixo disso vai para girada/sozinha (revisão manual)
 ROT = 90         # giro de figura larga demais (graus, sempre 90 — nunca de cabeça para baixo)
 FIG_RESERVA = 70  # espaço reservado para crédito/fonte da figura
 ROWS_PER_PAGE = 15
@@ -172,6 +199,7 @@ TEAL = Color(0.0, 0.660, 0.557)
 ACCENT = TEAL      # cor do fio da questão e do código (EM: cor da série)
 BLANK = 0          # páginas em branco depois da capa (EM: 1, exceto se a folha de rascunho cair ímpar-par)
 RASC_PAGES = []    # páginas de conteúdo onde caiu a folha de rascunho
+SCRATCH = []       # páginas de rascunho livre do original (ex.: 'RASCUNHO 2º DIA'): saem intactas antes da contracapa
 
 
 class QHead(Flowable):
@@ -254,28 +282,43 @@ class SecBox(Flowable):
 
 
 class TallParagraph(Paragraph):
-    """Parágrafo com imagem embutida mais alta que a linha (fração, raiz, símbolo):
-    o ReportLab desenha a 1ª linha a partir da altura normal da fonte e a imagem "vaza" para cima,
-    invadindo o que vem antes. Aqui a altura ganha esse excedente e o conteúdo desce junto."""
+    """Parágrafo com imagem embutida mais alta que a linha (fração, raiz, símbolo).
+    O ReportLab posiciona a 1ª linha pela altura normal da fonte: a imagem "vaza" para cima pelo excedente
+    (invadindo o que vem antes) e sobra o mesmo tanto vazio embaixo. Aqui o conteúdo desce esse excedente,
+    dentro da mesma altura — nada vaza e não sobra buraco."""
     def wrap(self, aw, ah):
         w, h = Paragraph.wrap(self, aw, ah)
         ls = getattr(self.blPara, 'lines', None) or []
+        # fórmula que caiu no começo de uma linha quebrada: o ReportLab (com fonte TTF) não soma a altura dela
+        # na linha. Corrige a altura dessas linhas e recalcula a do parágrafo.
+        mudou = False
+        fs = self.style.fontSize
+        for ln in ls:
+            ws = getattr(ln, 'words', None) or []
+            alt = [getattr(f, 'cbDefn', None).height for f in ws if getattr(f, 'cbDefn', None) is not None
+                   and getattr(f.cbDefn, 'kind', '') == 'img' and getattr(f.cbDefn, 'height', 0)]
+            if not alt:
+                continue
+            H = max(alt)
+            asc, desc = H / 2 + 0.4 * fs, -(H / 2 - 0.4 * fs)
+            if getattr(ln, 'ascent', 99) < asc - 0.5:
+                ln.ascent = asc; mudou = True
+            if getattr(ln, 'descent', -99) > desc + 0.5:
+                ln.descent = desc; mudou = True
+        if mudou and self.style.autoLeading == 'max':
+            lead = self.style.leading
+            h = sum(max(lead, getattr(l, 'ascent', fs) - getattr(l, 'descent', 0)) for l in ls)
+            self.height = h
         a0 = getattr(ls[0], 'ascent', 0) if ls else 0
         try:
             fa = getAscentDescent(self.style.fontName, self.style.fontSize)[0]
         except Exception:
             fa = self.style.fontSize * 0.75
         self._extra = max(0.0, a0 - fa)
-        self.height = h + self._extra
-        return w, self.height
+        return w, h
 
     def drawOn(self, canv, x, y, _sW=0):
-        H = self.height
-        self.height = H - self._extra
-        try:
-            Paragraph.drawOn(self, canv, x, y, _sW)
-        finally:
-            self.height = H
+        Paragraph.drawOn(self, canv, x, y - getattr(self, '_extra', 0.0), _sW)
 
     def split(self, aw, ah):
         return []
@@ -445,6 +488,8 @@ def item_flowables(it, src, state):
         # recuo de primeira linha ou bloco antes de enunciado: mantém ritmo da prova
         if any(r.get('math') for r in runs):
             ex['autoLeading'] = 'max'
+            ex['splitLongWords'] = 0     # 'palavra+fórmula' coladas vão juntas para a linha seguinte (senão a fórmula
+                                         # cai sozinha no começo da linha e o ReportLab não abre a entrelinha)
         PC = TallParagraph if any('img' in r for r in runs) else Paragraph
         return [PC(markup(runs, src, pno), ParagraphStyle('p', parent=ST_BODY, **ex))]
     if k == 'verse':
@@ -461,10 +506,13 @@ def item_flowables(it, src, state):
     if k == 'altfig':
         return [Fig(it['page'], it['rect'], FRAME_W, align='LEFT', is_alt=True, vector=True, tipo='alternativa')]
     if k == 'alt':
-        al = {'autoLeading': 'max'} if any(r.get('math') for r in it['runs']) else {}
+        al = {'autoLeading': 'max', 'splitLongWords': 0} if any(r.get('math') for r in it['runs']) else {}
         PC = TallParagraph if any('img' in r for r in it['runs']) else Paragraph
         p = PC(markup(it['runs'], src, pno), ParagraphStyle('a', parent=ST_ALT, spaceBefore=0, **al))
         fl = AltFlow(it['letter'], p)
+        fl.so_imagem = any('img' in r for r in it['runs']) and not any(r.get('t', '').strip() for r in it['runs'] if 't' in r)
+        fl.img_w = max([r['img'].width * S for r in it['runs'] if 'img' in r] + [0])
+        fl.img_h = max([r['img'].height * S for r in it['runs'] if 'img' in r] + [0])
         if al:
             fl.spaceBefore = 4
         return [fl]
@@ -502,7 +550,7 @@ def build_story(items, src, instr_flowables):
         if state.get('code') and not (k == 'sec' and 'REDAÇÃO' in ' '.join(it['lines'])):
             if cur is not None:
                 cur['fls'].append(Paragraph(esc(state['code']), mk('cd', fontName='Car', fontSize=7 * S, leading=7 * S + 2,
-                                                                  alignment=TA_RIGHT, textColor=TEAL)))
+                                                                  alignment=TA_RIGHT, textColor=ACCENT)))
             state['code'] = None
         if k == 'sec':
             txt = it['lines']
@@ -511,7 +559,7 @@ def build_story(items, src, instr_flowables):
                 cur = newgroup(it['src']); cur['newpage'] = True
                 if state.get('code'):
                     cur['fls'].append(Paragraph(esc(state['code']), mk('cd', fontName='Car', fontSize=7 * S, leading=7 * S + 2,
-                                                                      alignment=TA_RIGHT, textColor=TEAL)))
+                                                                      alignment=TA_RIGHT, textColor=ACCENT)))
                     state['code'] = None
                 cur['fls'].append(Paragraph(esc(txt[0]), mk('h', fontName='Car-B', fontSize=SEC_SRC * S, leading=SEC_SRC * S + 3,
                                                            alignment=TA_CENTER, spaceAfter=10)))
@@ -545,9 +593,31 @@ def build_story(items, src, instr_flowables):
         cur['fls'].extend(fls)
         state['prev'] = k
 
+    def grade_alternativas(fls, gi):
+        """Alternativas que são só figura (ex.: cinco desenhos de abridor) em duas colunas, como no original:
+        uma embaixo da outra ocupariam páginas inteiras com muito espaço vazio."""
+        idx = [i for i, f in enumerate(fls) if isinstance(f, AltFlow)]
+        if len(idx) < 4 or idx != list(range(idx[0], idx[0] + len(idx))):
+            return fls
+        alts = [fls[i] for i in idx]
+        meia = FRAME_W / 2 - 6
+        if not all(getattr(a, 'so_imagem', False) and a.img_w + ALT_IND + 4 <= meia for a in alts):
+            return fls
+        if sum(a.img_h for a in alts) < 0.55 * FRAME_H:
+            return fls                                   # cabem bem uma embaixo da outra: mantém
+        for a in alts:
+            a.gid = gi
+        linhas = [alts[i:i + 2] + ([''] if len(alts[i:i + 2]) == 1 else []) for i in range(0, len(alts), 2)]
+        t = Table(linhas, colWidths=[FRAME_W / 2, FRAME_W / 2], hAlign='LEFT')
+        t.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                               ('RIGHTPADDING', (0, 0), (-1, -1), 6), ('TOPPADDING', (0, 0), (-1, -1), 4),
+                               ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
+        return fls[:idx[0]] + [t] + fls[idx[-1] + 1:]
+
     # converte grupos -> story
     story = []
     for gi, g in enumerate(groups):
+        g['fls'] = grade_alternativas(g['fls'], gi)
         fls = g['fls']
         for f in fls:
             f.gid = gi
@@ -789,6 +859,8 @@ def pass2(src_path, content_path, out_path, npages, rp):
             pg.insert_text((O + x, O + 757.7), txt, fontsize=9, fontname='carb',
                            fontfile=fpath(BOLD_FILE), color=(0.137, 0.122, 0.125))
         pg.set_cropbox(pymupdf.Rect(O, O, O + W, O + H))
+    for sp_ in SCRATCH:                                            # rascunho livre do original, intacto
+        out.insert_pdf(src, from_page=sp_, to_page=sp_)
     out.insert_pdf(src, from_page=last_src, to_page=last_src)     # contracapa intacta
     md = out.metadata or {}
     md['producer'] = f'PSM Ampliação {VERSAO}'
@@ -814,7 +886,7 @@ def detectar_prova(items):
 
 
 # ------------------------------------------------------------------ auditoria / conferência
-_NORM_MAP = {'\u03c0': 'p', '\u22c5': '\u00b7', '\u2126': '\u03a9'}      # pi (SymbolMT 'p'), ponto matemático, ohm
+_NORM_MAP = {'\u03c0': 'p', '\u22c5': '\u00b7', '\u2126': '\u03a9', '\uf0b5': '\u0302'}      # pi (SymbolMT 'p'), ponto matemático, ohm
 
 
 _PC = {}
@@ -855,7 +927,9 @@ def _bclip():
 
 def _norm(s):
     from collections import Counter
-    return Counter(_NORM_MAP.get(c, c) for c in s.casefold() if not c.isspace() and c not in '-\u2011\u2003\u00ad\u200a')
+    import unicodedata
+    s = unicodedata.normalize('NFD', ''.join(_NORM_MAP.get(c, c) for c in s))      # 'Ô' = 'O' + acento (como no original)
+    return Counter(_NORM_MAP.get(c, c) for c in s.casefold() if not c.isspace() and c not in '-\u2011\u2003\u00ad\u200a\u200b')
 
 
 def _chars(page, clip, excl=()):
@@ -963,7 +1037,7 @@ def conferir(src_path, out_path, items, tipo, rp):
 
     # 5) numeração de páginas sequencial no rodapé
     errs = []
-    for p in range(1 + BLANK, len(out) - 1):
+    for p in range(1 + BLANK, len(out) - 1 - len(SCRATCH)):
         nums = []
         if NUMSTYLE == '2026':
             for blk in _gt(out[p], 'rawdict', pymupdf.Rect(0, FTR_Y + 2, W + 10, 765))['blocks']:
@@ -994,7 +1068,7 @@ def conferir(src_path, out_path, items, tipo, rp):
     # 6) nenhuma página em branco, nenhum texto fora da folha
     brancas, fora_tx = [], []
     figpag = {pn + BLANK for (pn, *_r) in FIGS}
-    for p in range(1 + BLANK, len(out) - 1):
+    for p in range(1 + BLANK, len(out) - 1 - len(SCRATCH)):
         d = _gt(out[p], 'rawdict', _bclip())
         txt = ''.join(c['c'] for b in d['blocks'] if b['type'] == 0 for l in b['lines'] for sp in l['spans'] for c in sp['chars']).strip()
         if not txt and p not in figpag and not _eh_rascunho(out[p]):
@@ -1044,7 +1118,7 @@ def conferir(src_path, out_path, items, tipo, rp):
         add('Rascunho da redação: 2 páginas, linhas 1 a 30', len(pgs) == 2 and sorted(nums) == list(range(1, 31)),
             f'{len(pgs)} página(s), linhas {min(nums) if nums else "-"} a {max(nums) if nums else "-"}')
     elif tipo['prova'] == 'II':
-        pgs = [p for p in range(1, len(out) - 1) if _eh_rascunho(out[p])]
+        pgs = [p for p in range(1, len(out) - 1 - len(SCRATCH)) if _eh_rascunho(out[p])]
         add('Prova II: sem folha de redação', not pgs, 'ok' if not pgs else f'rascunho encontrado nas páginas {[p+1 for p in pgs]}')
     return aud, ck
 
@@ -1240,7 +1314,8 @@ def _prepara(pdf_bytes, workdir):
         f.write(pdf_bytes)
     src = pymupdf.open(path)
     rp = find_rascunho_page(src)
-    pages = [p for p in range(1, len(src) - 1) if p != rp]
+    SCRATCH[:] = enem_parse.find_scratch_pages(src)
+    pages = [p for p in range(1, len(src) - 1) if p != rp and p not in SCRATCH]
     items = build_items(src, pages)
     tipo = detectar_prova(items)
     avisos = []
